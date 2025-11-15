@@ -1,4 +1,6 @@
-use kurbo::{Arc, BezPath, Circle, Ellipse, Insets, PathEl, Point, Rect, RoundedRect, Shape as _, Vec2};
+use kurbo::{
+    Arc, BezPath, Circle, Ellipse, Insets, PathEl, Point, Rect, RoundedRect, Shape as _, Vec2,
+};
 use std::{f64::consts::FRAC_PI_2, f64::consts::PI};
 
 use super::non_uniform_radii::NonUniformRoundedRectRadii;
@@ -34,9 +36,11 @@ pub struct CssBox {
     pub padding_box: Rect,
     pub content_box: Rect,
     pub outline_box: Rect,
+    pub margin_box: Rect,
 
     pub padding_width: Insets,
     pub border_width: Insets,
+    pub margin_width: Insets,
     pub outline_width: f64,
 
     pub border_radii: NonUniformRoundedRectRadii,
@@ -47,12 +51,19 @@ impl CssBox {
         border_box: Rect,
         border: Insets,
         padding: Insets,
+        margin: Insets,
         outline_width: f64,
         mut border_radii: NonUniformRoundedRectRadii,
     ) -> Self {
         let padding_box = border_box - border;
         let content_box = padding_box - padding;
         let outline_box = border_box.inset(outline_width);
+        let margin_box = Rect::new(
+            border_box.x0 - margin.x0,
+            border_box.y0 - margin.y0,
+            border_box.x1 + margin.x1,
+            border_box.y1 + margin.y1,
+        );
 
         // Correct the border radii if they are too big if two border radii would intersect, then we need to shrink
         // ALL border radii by the same factor such that they do not
@@ -79,9 +90,11 @@ impl CssBox {
             border_box,
             content_box,
             outline_box,
+            margin_box,
             outline_width,
             padding_width: padding,
             border_width: border,
+            margin_width: margin,
             border_radii,
         }
     }
@@ -174,6 +187,30 @@ impl CssBox {
         path
     }
 
+    /// Construct a bezpath approximating the margin box.
+    /// TODO: include rounded corners when margin radii are available.
+    pub fn margin_box_path(&self) -> BezPath {
+        let mut path = BezPath::new();
+        path.move_to(Point {
+            x: self.margin_box.x0,
+            y: self.margin_box.y0,
+        });
+        path.line_to(Point {
+            x: self.margin_box.x1,
+            y: self.margin_box.y0,
+        });
+        path.line_to(Point {
+            x: self.margin_box.x1,
+            y: self.margin_box.y1,
+        });
+        path.line_to(Point {
+            x: self.margin_box.x0,
+            y: self.margin_box.y1,
+        });
+        path.close_path();
+        path
+    }
+
     pub fn circle_path(&self, center: Point, radius: f64) -> BezPath {
         let path = Circle::new(center, radius).to_path(BezPath::TOLERANCE);
         path
@@ -201,7 +238,14 @@ impl CssBox {
         path
     }
 
-    pub fn rect_path(&self, x0: f64, y0: f64, x1: f64, y1: f64, radii: (f64, f64, f64, f64)) -> BezPath {
+    pub fn rect_path(
+        &self,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        radii: (f64, f64, f64, f64),
+    ) -> BezPath {
         let path = RoundedRect::new(x0, y0, x1, y1, radii).to_path(BezPath::TOLERANCE);
         path
     }
