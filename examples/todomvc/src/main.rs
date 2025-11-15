@@ -1,10 +1,14 @@
+// On Windows do NOT show a console window when opening the app
+#![cfg_attr(all(not(test), target_os = "windows"), windows_subsystem = "windows")]
+
 //! The typical TodoMVC app, implemented in Dioxus.
 
 use dioxus::prelude::*;
 use std::collections::HashMap;
 
 fn main() {
-    // tracing_subscriber::fmt::init();
+    #[cfg(feature = "tracing")]
+    tracing_subscriber::fmt::init();
 
     // Note: "mini-dxn" is a cut down version of the "dioxus-native" crate used internally for testing Blitz
     // In real apps you should prefer to use "dioxus-native" (or for a cross platform app, the main "dioxus" crate)
@@ -219,7 +223,7 @@ fn TodoEntry(mut todos: Signal<HashMap<u32, TodoItem>>, id: u32) -> Element {
 #[component]
 fn ListFooter(
     mut todos: Signal<HashMap<u32, TodoItem>>,
-    active_todo_count: ReadOnlySignal<usize>,
+    active_todo_count: ReadSignal<usize>,
     mut filter: Signal<FilterState>,
 ) -> Element {
     // We use a memoized signal to calculate whether we should show the "Clear completed" button.

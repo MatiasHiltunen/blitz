@@ -92,12 +92,15 @@ async fn main() {
             break;
         };
         document.as_mut().load_resource(res);
+
+        // HACK: this fixes a deadlock by forcing thread synchronisation.
+        println!("{} resources remaining {}", net.count(), net.is_empty());
     }
 
     timer.time("Fetched assets");
 
     // Compute style, layout, etc for HtmlDocument
-    document.as_mut().resolve();
+    document.as_mut().resolve(0.0);
 
     timer.time("Resolved styles and layout");
 

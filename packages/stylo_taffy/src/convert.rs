@@ -29,6 +29,9 @@ pub(crate) mod stylo {
 
     pub(crate) type Gap = GenericLengthPercentageOrNormal<NonNegative<LengthPercentage>>;
 
+    #[cfg(feature = "floats")]
+    pub(crate) use style::values::computed::{Clear, Float};
+
     #[cfg(feature = "flexbox")]
     pub(crate) use style::{
         computed_values::{flex_direction::T as FlexDirection, flex_wrap::T as FlexWrap},
@@ -80,6 +83,7 @@ pub fn dimension(val: &stylo::Size) -> taffy::Dimension {
         stylo::Size::FitContent => taffy::Dimension::AUTO,
         stylo::Size::FitContentFunction(_) => taffy::Dimension::AUTO,
         stylo::Size::Stretch => taffy::Dimension::AUTO,
+        stylo::Size::WebkitFillAvailable => taffy::Dimension::AUTO,
 
         // Anchor positioning will be flagged off for time being
         stylo::Size::AnchorSizeFunction(_) => unreachable!(),
@@ -99,6 +103,7 @@ pub fn max_size_dimension(val: &stylo::MaxSize) -> taffy::Dimension {
         stylo::MaxSize::FitContent => taffy::Dimension::AUTO,
         stylo::MaxSize::FitContentFunction(_) => taffy::Dimension::AUTO,
         stylo::MaxSize::Stretch => taffy::Dimension::AUTO,
+        stylo::MaxSize::WebkitFillAvailable => taffy::Dimension::AUTO,
 
         // Anchor positioning will be flagged off for time being
         stylo::MaxSize::AnchorSizeFunction(_) => unreachable!(),
@@ -329,6 +334,33 @@ pub fn flex_wrap(input: stylo::FlexWrap) -> taffy::FlexWrap {
     }
 }
 
+#[inline]
+#[cfg(feature = "floats")]
+pub fn float(input: stylo::Float) -> taffy::Float {
+    match input {
+        stylo::Float::Left => taffy::Float::Left,
+        stylo::Float::Right => taffy::Float::Right,
+        stylo::Float::None => taffy::Float::None,
+
+        stylo::Float::InlineStart => taffy::Float::Left,
+        stylo::Float::InlineEnd => taffy::Float::Right,
+    }
+}
+
+#[inline]
+#[cfg(feature = "floats")]
+pub fn clear(input: stylo::Clear) -> taffy::Clear {
+    match input {
+        stylo::Clear::Left => taffy::Clear::Left,
+        stylo::Clear::Right => taffy::Clear::Right,
+        stylo::Clear::Both => taffy::Clear::Both,
+        stylo::Clear::None => taffy::Clear::None,
+
+        stylo::Clear::InlineStart => taffy::Clear::Left,
+        stylo::Clear::InlineEnd => taffy::Clear::Right,
+    }
+}
+
 // CSS Grid styles
 // ===============
 
@@ -553,6 +585,11 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
         },
         scrollbar_width: 0.0,
 
+        #[cfg(feature = "floats")]
+        float: self::float(style.clone_float()),
+        #[cfg(feature = "floats")]
+        clear: self::clear(style.clone_clear()),
+
         size: taffy::Size {
             width: self::dimension(&pos.width),
             height: self::dimension(&pos.height),
@@ -601,17 +638,17 @@ pub fn to_taffy_style(style: &stylo::ComputedValues) -> taffy::Style<Atom> {
 
         // Alignment
         #[cfg(any(feature = "flexbox", feature = "grid"))]
-        align_content: self::content_alignment(pos.align_content.0),
+        align_content: self::content_alignment(pos.align_content),
         #[cfg(any(feature = "flexbox", feature = "grid"))]
-        justify_content: self::content_alignment(pos.justify_content.0),
+        justify_content: self::content_alignment(pos.justify_content),
         #[cfg(any(feature = "flexbox", feature = "grid"))]
         align_items: self::item_alignment(pos.align_items.0),
         #[cfg(any(feature = "flexbox", feature = "grid"))]
-        align_self: self::item_alignment((pos.align_self.0).0),
+        align_self: self::item_alignment(pos.align_self.0),
         #[cfg(feature = "grid")]
-        justify_items: self::item_alignment(pos.justify_items.computed.0),
+        justify_items: self::item_alignment((pos.justify_items.computed.0).0),
         #[cfg(feature = "grid")]
-        justify_self: self::item_alignment((pos.justify_self.0).0),
+        justify_self: self::item_alignment(pos.justify_self.0),
         #[cfg(feature = "block")]
         text_align: self::text_align(style.clone_text_align()),
 

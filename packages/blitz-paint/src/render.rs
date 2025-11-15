@@ -2,7 +2,7 @@ mod background;
 mod box_shadow;
 mod form_controls;
 
-use std::sync::Arc;
+use std::any::Any;
 
 use super::kurbo_css::{CssBox, Edge};
 use crate::color::{Color, ToColorColor};
@@ -39,7 +39,7 @@ use style::{
 };
 
 use kurbo::{self, Affine, Insets, PathEl, Point, Rect, Shape, Stroke, Vec2};
-use peniko::{self, Fill};
+use peniko::{self, Fill, ImageData, ImageSampler};
 use style::values::generics::{
     color::GenericColor,
     position::GenericPositionOrAuto,
@@ -258,8 +258,8 @@ impl BlitzDomPainter<'_> {
     }
 
     fn layout(&self, child: usize) -> Layout {
-        self.dom.as_ref().tree()[child].unrounded_layout
-        // self.dom.tree()[child].final_layout
+        // self.dom.as_ref().tree()[child].unrounded_layout
+        self.dom.as_ref().tree()[child].final_layout
     }
 
     /// Draw the current tree to current render surface
@@ -836,6 +836,15 @@ impl BlitzDomPainter<'_> {
         // By performing the transform, we prevent the cache from becoming invalid when the page shifts around
         let mut transform = Affine::translate(box_position.to_vec2() * scale);
 
+        // Reference box for resolve percentage transforms
+        let reference_box = euclid::Rect::new(
+            euclid::Point2D::new(CSSPixelLength::new(0.0), CSSPixelLength::new(0.0)),
+            euclid::Size2D::new(
+                CSSPixelLength::new(frame.border_box.width() as f32),
+                CSSPixelLength::new(frame.border_box.height() as f32),
+            ),
+        );
+
         // Apply CSS transform property (where transforms are 2d)
         //
         // TODO: Handle hit testing correctly for transformed nodes
@@ -843,7 +852,7 @@ impl BlitzDomPainter<'_> {
         let (t, has_3d) = &style
             .get_box()
             .transform
-            .to_transform_3d_matrix(None)
+            .to_transform_3d_matrix(Some(&reference_box))
             .unwrap_or((Transform3D::default(), false));
         if !has_3d {
             // See: https://drafts.csswg.org/css-transforms-2/#two-dimensional-subset
@@ -863,7 +872,7 @@ impl BlitzDomPainter<'_> {
                     .px() as f64,
                 y: transform_origin
                     .vertical
-                    .resolve(CSSPixelLength::new(frame.border_box.width() as f32))
+                    .resolve(CSSPixelLength::new(frame.border_box.height() as f32))
                     .px() as f64,
             });
             let kurbo_transform =
@@ -901,16 +910,21 @@ fn to_image_quality(image_rendering: ImageRendering) -> peniko::ImageQuality {
 }
 
 /// Ensure that the `resized_image` field has a correctly sized image
-fn to_peniko_image(image: &RasterImageData, quality: peniko::ImageQuality) -> peniko::Image {
-    peniko::Image {
-        data: peniko::Blob::new(image.data.clone()),
-        format: peniko::ImageFormat::Rgba8,
-        width: image.width,
-        height: image.height,
-        alpha: 1.0,
-        x_extend: peniko::Extend::Repeat,
-        y_extend: peniko::Extend::Repeat,
-        quality,
+fn to_peniko_image(image: &RasterImageData, quality: peniko::ImageQuality) -> peniko::ImageBrush {
+    peniko::ImageBrush {
+        image: ImageData {
+            data: image.data.clone(),
+            format: peniko::ImageFormat::Rgba8,
+            width: image.width,
+            height: image.height,
+            alpha_type: peniko::ImageAlphaType::Alpha,
+        },
+        sampler: ImageSampler {
+            x_extend: peniko::Extend::Repeat,
+            y_extend: peniko::Extend::Repeat,
+            quality,
+            alpha: 1.0,
+        },
     }
 }
 
@@ -929,6 +943,11 @@ struct ElementCx<'a> {
     text_input: Option<&'a TextInputData>,
     list_item: Option<&'a ListItemLayout>,
     devtools: &'a DevtoolSettings,
+}
+
+/// Converts parley BoundingBox into peniko Rect
+fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
+    peniko::kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1)
 }
 
 impl ElementCx<'_> {
@@ -965,11 +984,20 @@ impl ElementCx<'_> {
                         transform,
                         color::palette::css::STEEL_BLUE,
                         None,
-                        &rect,
+                        &convert_rect(rect),
                     );
                 }
                 if let Some(cursor) = input_data.editor.cursor_geometry(1.5) {
-                    scene.fill(Fill::NonZero, transform, Color::BLACK, None, &cursor);
+                    // TODO: Use the `caret-color` attribute here if present.
+                    let color = self.style.get_inherited_text().color;
+
+                    scene.fill(
+                        Fill::NonZero,
+                        transform,
+                        color.as_srgb_color(),
+                        None,
+                        &convert_rect(&cursor),
+                    );
                 };
             }
 
@@ -1021,9 +1049,32 @@ impl ElementCx<'_> {
     }
 
     fn draw_children(&self, scene: &mut impl PaintScene) {
+        // Negative z_index hoisted nodes
+        if let Some(hoisted) = &self.node.stacking_context {
+            for hoisted_child in hoisted.neg_z_hoisted_children() {
+                let pos = kurbo::Point {
+                    x: self.pos.x + hoisted_child.position.x as f64,
+                    y: self.pos.y + hoisted_child.position.y as f64,
+                };
+                self.render_node(scene, hoisted_child.node_id, pos);
+            }
+        }
+
+        // Regular children
         if let Some(children) = &*self.node.paint_children.borrow() {
             for child_id in children {
                 self.render_node(scene, *child_id, self.pos);
+            }
+        }
+
+        // Positive z_index hoisted nodes
+        if let Some(hoisted) = &self.node.stacking_context {
+            for hoisted_child in hoisted.pos_z_hoisted_children() {
+                let pos = kurbo::Point {
+                    x: self.pos.x + hoisted_child.position.x as f64,
+                    y: self.pos.y + hoisted_child.position.y as f64,
+                };
+                self.render_node(scene, hoisted_child.node_id, pos);
             }
         }
     }
@@ -1117,7 +1168,7 @@ impl ElementCx<'_> {
                 .pre_scale_non_uniform(x_scale, y_scale)
                 .then_translate(Vec2 { x, y });
 
-            scene.draw_image(&to_peniko_image(image, quality), transform);
+            scene.draw_image(to_peniko_image(image, quality).as_ref(), transform);
         }
     }
 
@@ -1134,12 +1185,12 @@ impl ElementCx<'_> {
                 Fill::NonZero,
                 transform,
                 // TODO: replace `Arc<dyn Any>` with `CustomPaint` in API?
-                Paint::Custom(Arc::new(CustomPaint {
+                Paint::Custom(&CustomPaint {
                     source_id: custom_paint_source.custom_paint_source_id,
                     width,
                     height,
                     scale: self.scale,
-                })),
+                } as &(dyn Any + Send + Sync)),
                 None,
                 &Rect::from_origin_size((0.0, 0.0), (width as f64, height as f64)),
             );

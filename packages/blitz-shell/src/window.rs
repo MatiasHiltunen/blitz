@@ -13,6 +13,7 @@ use winit::keyboard::PhysicalKey;
 
 use std::sync::Arc;
 use std::task::Waker;
+use std::time::Instant;
 use winit::event::{ElementState, MouseButton};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::{Theme, WindowAttributes, WindowId};
@@ -60,6 +61,8 @@ pub struct View<Rend: WindowRenderer> {
     pub keyboard_modifiers: Modifiers,
     pub buttons: MouseEventButtons,
     pub mouse_pos: (f32, f32),
+    pub animation_timer: Option<Instant>,
+    pub is_visible: bool,
 
     #[cfg(feature = "accessibility")]
     /// Accessibility adapter for `accesskit`.
@@ -73,9 +76,6 @@ impl<Rend: WindowRenderer> View<Rend> {
         proxy: &EventLoopProxy<BlitzShellEvent>,
     ) -> Self {
         let winit_window = Arc::from(event_loop.create_window(config.attributes).unwrap());
-
-        // TODO: make this conditional on text input focus
-        winit_window.set_ime_allowed(true);
 
         // Create viewport
         let size = winit_window.inner_size();
@@ -102,6 +102,7 @@ impl<Rend: WindowRenderer> View<Rend> {
         Self {
             renderer: config.renderer,
             waker: None,
+            animation_timer: None,
             keyboard_modifiers: Default::default(),
             event_loop_proxy: proxy.clone(),
             window: winit_window.clone(),
@@ -109,6 +110,7 @@ impl<Rend: WindowRenderer> View<Rend> {
             theme_override: None,
             buttons: MouseEventButtons::None,
             mouse_pos: Default::default(),
+            is_visible: winit_window.is_visible().unwrap_or(true),
             #[cfg(feature = "accessibility")]
             accessibility: AccessibilityState::new(&winit_window, proxy.clone()),
         }
@@ -147,12 +149,23 @@ impl<Rend: WindowRenderer> View<Rend> {
     pub fn downcast_doc_mut<T: 'static>(&mut self) -> &mut T {
         self.doc.as_any_mut().downcast_mut::<T>().unwrap()
     }
+
+    pub fn current_animation_time(&mut self) -> f64 {
+        match &self.animation_timer {
+            Some(start) => Instant::now().duration_since(*start).as_secs_f64(),
+            None => {
+                self.animation_timer = Some(Instant::now());
+                0.0
+            }
+        }
+    }
 }
 
 impl<Rend: WindowRenderer> View<Rend> {
     pub fn resume(&mut self) {
         // Resolve dom
-        self.doc.resolve();
+        let animation_time = self.current_animation_time();
+        self.doc.resolve(animation_time);
 
         // Resume renderer
         let (width, height) = self.doc.viewport().window_size;
@@ -201,13 +214,14 @@ impl<Rend: WindowRenderer> View<Rend> {
     }
 
     pub fn redraw(&mut self) {
-        self.doc.resolve();
+        let animation_time = self.current_animation_time();
+        self.doc.resolve(animation_time);
         let (width, height) = self.doc.viewport().window_size;
         let scale = self.doc.viewport().scale_f64();
         self.renderer
             .render(|scene| paint_scene(scene, &self.doc, scale, width, height));
 
-        if self.doc.is_animating() {
+        if self.is_visible && self.doc.is_animating() {
             self.request_redraw();
         }
     }
@@ -247,7 +261,12 @@ impl<Rend: WindowRenderer> View<Rend> {
 
             // Window size/position events
             WindowEvent::Moved(_) => {}
-            WindowEvent::Occluded(_) => {},
+            WindowEvent::Occluded(is_occluded) => {
+                self.is_visible = !is_occluded;
+                if self.is_visible {
+                    self.request_redraw();
+                }
+            },
             WindowEvent::Resized(physical_size) => {
                 self.with_viewport(|v| v.window_size = (physical_size.width, physical_size.height));
             }
@@ -335,7 +354,6 @@ impl<Rend: WindowRenderer> View<Rend> {
                     mods: winit_modifiers_to_kbt_modifiers(self.keyboard_modifiers.state()),
                 });
                 self.doc.handle_ui_event(event);
-                self.request_redraw();
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 let button = match button {
@@ -370,12 +388,15 @@ impl<Rend: WindowRenderer> View<Rend> {
                     winit::event::MouseScrollDelta::PixelDelta(offsets) => (offsets.x, offsets.y)
                 };
 
-                if let Some(hover_node_id) = self.doc.get_hover_node_id() {
-                    self.doc.scroll_node_by(hover_node_id, scroll_x, scroll_y);
+                let has_changed = if let Some(hover_node_id) = self.doc.get_hover_node_id() {
+                    self.doc.scroll_node_by_has_changed(hover_node_id, scroll_x, scroll_y)
                 } else {
-                    self.doc.scroll_viewport_by(scroll_x, scroll_y);
+                    self.doc.scroll_viewport_by_has_changed(scroll_x, scroll_y)
+                };
+
+                if has_changed {
+                    self.request_redraw();
                 }
-                self.request_redraw();
             }
 
             // File events

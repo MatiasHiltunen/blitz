@@ -15,10 +15,18 @@ mod markdown {
     pub(crate) use pulldown_cmark::*;
 }
 
+#[cfg(feature = "skia")]
+use anyrender_skia::SkiaWindowRenderer as WindowRenderer;
+#[cfg(feature = "skia-pixels")]
+use anyrender_skia::raster::SkiaRasterWindowRenderer as WindowRenderer;
+#[cfg(feature = "skia-softbuffer")]
+use anyrender_skia::raster::SkiaRasterWindowRenderer as WindowRenderer;
 #[cfg(feature = "gpu")]
 use anyrender_vello::VelloWindowRenderer as WindowRenderer;
 #[cfg(feature = "cpu-base")]
 use anyrender_vello_cpu::VelloCpuWindowRenderer as WindowRenderer;
+#[cfg(feature = "hybrid")]
+use anyrender_vello_hybrid::VelloHybridWindowRenderer as WindowRenderer;
 
 use blitz_dom::DocumentConfig;
 use blitz_dom::net::Resource;

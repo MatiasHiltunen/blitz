@@ -11,6 +11,7 @@
 mod application;
 mod convert_events;
 mod event;
+mod net;
 mod window;
 
 #[cfg(feature = "accessibility")]
@@ -18,10 +19,12 @@ mod accessibility;
 
 pub use crate::application::BlitzApplication;
 pub use crate::event::BlitzShellEvent;
+pub use crate::net::BlitzShellNetCallback;
 pub use crate::window::{View, WindowConfig};
 
-use blitz_dom::net::Resource;
-use blitz_traits::net::NetCallback;
+#[cfg(feature = "data-uri")]
+pub use crate::net::DataUriNetProvider;
+
 #[cfg(all(
     feature = "file_dialog",
     any(
@@ -37,6 +40,7 @@ use blitz_traits::net::NetCallback;
 use blitz_traits::shell::FileDialogFilter;
 use blitz_traits::shell::ShellProvider;
 use std::sync::Arc;
+use winit::dpi::{LogicalPosition, LogicalSize};
 pub use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 pub use winit::window::{CursorIcon, Window};
 
@@ -79,29 +83,6 @@ pub fn current_android_app() -> android_activity::AndroidApp {
     ANDROID_APP.get().unwrap().clone()
 }
 
-/// A NetCallback that injects the fetched Resource into our winit event loop
-pub struct BlitzShellNetCallback(EventLoopProxy<BlitzShellEvent>);
-
-impl BlitzShellNetCallback {
-    pub fn new(proxy: EventLoopProxy<BlitzShellEvent>) -> Self {
-        Self(proxy)
-    }
-
-    pub fn shared(proxy: EventLoopProxy<BlitzShellEvent>) -> Arc<dyn NetCallback<Resource>> {
-        Arc::new(Self(proxy))
-    }
-}
-impl NetCallback<Resource> for BlitzShellNetCallback {
-    fn call(&self, doc_id: usize, result: Result<Resource, Option<String>>) {
-        // TODO: handle error case
-        if let Ok(data) = result {
-            self.0
-                .send_event(BlitzShellEvent::ResourceLoad { doc_id, data })
-                .unwrap()
-        }
-    }
-}
-
 pub struct BlitzShellProvider {
     window: Arc<Window>,
 }
@@ -120,6 +101,13 @@ impl ShellProvider for BlitzShellProvider {
     }
     fn set_window_title(&self, title: String) {
         self.window.set_title(&title);
+    }
+    fn set_ime_enabled(&self, is_enabled: bool) {
+        self.window.set_ime_allowed(is_enabled);
+    }
+    fn set_ime_cursor_area(&self, x: f32, y: f32, width: f32, height: f32) {
+        self.window
+            .set_ime_cursor_area(LogicalPosition::new(x, y), LogicalSize::new(width, height));
     }
 
     #[cfg(all(

@@ -29,6 +29,9 @@
 pub const DEFAULT_CSS: &str = include_str!("../assets/default.css");
 pub(crate) const BULLET_FONT: &[u8] = include_bytes!("../assets/moz-bullet-font.otf");
 
+const INCREMENTAL: bool = cfg!(feature = "incremental");
+const NON_INCREMENTAL: bool = !INCREMENTAL;
+
 /// The DOM implementation.
 ///
 /// This is the primary entry point for this crate.
@@ -47,6 +50,7 @@ mod html;
 mod layout;
 mod mutator;
 mod query_selector;
+mod resolve;
 /// Implementations that interact with servo's style engine
 mod stylo;
 mod stylo_to_cursor_icon;
@@ -74,3 +78,4 @@ pub use style::invalidation::element::restyle_hints::RestyleHint;
 pub type SelectorList = selectors::SelectorList<style::selector_parser::SelectorImpl>;
 pub use events::{EventDriver, EventHandler, NoopEventHandler};
 pub use html::{DummyHtmlParserProvider, HtmlParserProvider};
+pub use util::Point;

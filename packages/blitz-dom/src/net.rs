@@ -1,16 +1,14 @@
 use selectors::context::QuirksMode;
-use std::{io::Cursor, sync::Arc, sync::atomic::AtomicBool};
+use std::{io::Cursor, sync::Arc};
 use style::{
     font_face::{FontFaceSourceFormat, FontFaceSourceFormatKeyword, Source},
     media_queries::MediaList,
-    parser::ParserContext,
     servo_arc::Arc as ServoArc,
     shared_lock::SharedRwLock,
     shared_lock::{Locked, SharedRwLockReadGuard},
     stylesheets::{
-        AllowImportRules, CssRule, CssRules, DocumentStyleSheet, ImportRule, Origin, Stylesheet,
-        StylesheetContents, StylesheetInDocument, StylesheetLoader as ServoStylesheetLoader,
-        UrlExtraData,
+        AllowImportRules, CssRule, DocumentStyleSheet, ImportRule, Origin, Stylesheet,
+        StylesheetInDocument, StylesheetLoader as ServoStylesheetLoader, UrlExtraData,
         import_rule::{ImportLayer, ImportSheet, ImportSupportsCondition},
     },
     values::{CssUrl, SourceLocation},
@@ -49,7 +47,6 @@ impl ServoStylesheetLoader for StylesheetLoader {
         &self,
         url: CssUrl,
         location: SourceLocation,
-        context: &ParserContext,
         lock: &SharedRwLock,
         media: ServoArc<Locked<MediaList>>,
         supports: Option<ImportSupportsCondition>,
@@ -65,76 +62,74 @@ impl ServoStylesheetLoader for StylesheetLoader {
             }));
         }
 
-        let sheet = ServoArc::new(Stylesheet {
-            contents: StylesheetContents::from_data(
-                CssRules::new(Vec::new(), lock),
-                context.stylesheet_origin,
-                context.url_data.clone(),
-                context.quirks_mode,
-            ),
-            media,
-            shared_lock: lock.clone(),
-            disabled: AtomicBool::new(false),
-        });
-
-        let stylesheet = ImportSheet::new(sheet.clone());
         let import = ImportRule {
             url,
-            stylesheet,
+            stylesheet: ImportSheet::new_pending(),
             supports,
             layer,
             source_location: location,
         };
 
-        struct StylesheetLoaderInner {
-            loader: StylesheetLoader,
-            read_lock: SharedRwLock,
-            url: ServoArc<Url>,
-            sheet: ServoArc<Stylesheet>,
-            provider: SharedProvider<Resource>,
-        }
-        impl NetHandler<Resource> for StylesheetLoaderInner {
-            fn bytes(
-                self: Box<Self>,
-                doc_id: usize,
-                bytes: Bytes,
-                callback: SharedCallback<Resource>,
-            ) {
-                let Ok(css) = std::str::from_utf8(&bytes) else {
-                    callback.call(doc_id, Err(Some(String::from("Invalid UTF8"))));
-                    return;
-                };
-
-                // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
-                // let escaped_css = html_escape::decode_html_entities(css);
-                Stylesheet::update_from_str(
-                    &self.sheet,
-                    css,
-                    UrlExtraData(self.url),
-                    Some(&self.loader),
-                    None,
-                    AllowImportRules::Yes,
-                );
-                fetch_font_face(doc_id, &self.sheet, &self.provider, &self.read_lock.read());
-                callback.call(doc_id, Ok(Resource::None))
-            }
-        }
-        let url = import.url.url().unwrap();
+        let url = import.url.url().unwrap().clone();
+        let import = ServoArc::new(lock.wrap(import));
         self.1.fetch(
             self.0,
             Request::get(url.as_ref().clone()),
             Box::new(StylesheetLoaderInner {
                 url: url.clone(),
                 loader: self.clone(),
-                read_lock: lock.clone(),
-                sheet: sheet.clone(),
+                lock: lock.clone(),
+                media,
+                import_rule: import.clone(),
                 provider: self.1.clone(),
             }),
         );
 
-        ServoArc::new(lock.wrap(import))
+        import
     }
 }
+
+struct StylesheetLoaderInner {
+    loader: StylesheetLoader,
+    lock: SharedRwLock,
+    url: ServoArc<Url>,
+    media: ServoArc<Locked<MediaList>>,
+    import_rule: ServoArc<Locked<ImportRule>>,
+    provider: SharedProvider<Resource>,
+}
+
+impl NetHandler<Resource> for StylesheetLoaderInner {
+    fn bytes(self: Box<Self>, doc_id: usize, bytes: Bytes, callback: SharedCallback<Resource>) {
+        let Ok(css) = std::str::from_utf8(&bytes) else {
+            callback.call(doc_id, Err(Some(String::from("Invalid UTF8"))));
+            return;
+        };
+
+        // NOTE(Nico): I don't *think* external stylesheets should have HTML entities escaped
+        // let escaped_css = html_escape::decode_html_entities(css);
+
+        let sheet = ServoArc::new(Stylesheet::from_str(
+            css,
+            UrlExtraData(self.url),
+            Origin::Author,
+            self.media.clone(),
+            self.lock.clone(),
+            Some(&self.loader),
+            None, // error_reporter
+            QuirksMode::NoQuirks,
+            AllowImportRules::Yes,
+        ));
+
+        // Fetch @font-face fonts
+        fetch_font_face(doc_id, &sheet, &self.provider, &self.lock.read());
+
+        let mut guard = self.lock.write();
+        self.import_rule.write_with(&mut guard).stylesheet = ImportSheet::Sheet(sheet);
+
+        callback.call(doc_id, Ok(Resource::None))
+    }
+}
+
 impl NetHandler<Resource> for CssHandler {
     fn bytes(self: Box<Self>, doc_id: usize, bytes: Bytes, callback: SharedCallback<Resource>) {
         let Ok(css) = std::str::from_utf8(&bytes) else {
@@ -152,12 +147,13 @@ impl NetHandler<Resource> for CssHandler {
             ServoArc::new(self.guard.wrap(MediaList::empty())),
             self.guard.clone(),
             Some(&StylesheetLoader(doc_id, self.provider.clone())),
-            None,
+            None, // error_reporter
             QuirksMode::NoQuirks,
             AllowImportRules::Yes,
         );
-        let read_guard = self.guard.read();
-        fetch_font_face(doc_id, &sheet, &self.provider, &read_guard);
+
+        // Fetch @font-face fonts
+        fetch_font_face(doc_id, &sheet, &self.provider, &self.guard.read());
 
         callback.call(
             doc_id,
@@ -171,25 +167,25 @@ impl NetHandler<Resource> for CssHandler {
 struct FontFaceHandler(FontFaceSourceFormatKeyword);
 impl NetHandler<Resource> for FontFaceHandler {
     fn bytes(mut self: Box<Self>, doc_id: usize, bytes: Bytes, callback: SharedCallback<Resource>) {
-        if self.0 == FontFaceSourceFormatKeyword::None {
-            self.0 = match bytes.as_ref() {
+        if self.0 == FontFaceSourceFormatKeyword::None && bytes.len() >= 4 {
+            self.0 = match &bytes.as_ref()[0..4] {
                 // WOFF (v1) files begin with 0x774F4646 ('wOFF' in ascii)
                 // See: <https://w3c.github.io/woff/woff1/spec/Overview.html#WOFFHeader>
-                // #[cfg(any(feature = "woff-c"))]
-                // [b'w', b'O', b'F', b'F', ..] => FontFaceSourceFormatKeyword::Woff,
+                #[cfg(any(feature = "woff-c", feature = "woff-rust"))]
+                b"wOFF" => FontFaceSourceFormatKeyword::Woff,
                 // WOFF2 files begin with 0x774F4632 ('wOF2' in ascii)
                 // See: <https://w3c.github.io/woff/woff2/#woff20Header>
                 #[cfg(any(feature = "woff-c", feature = "woff-rust"))]
-                [b'w', b'O', b'F', b'2', ..] => FontFaceSourceFormatKeyword::Woff2,
+                b"wOF2" => FontFaceSourceFormatKeyword::Woff2,
                 // Opentype fonts with CFF data begin with 0x4F54544F ('OTTO' in ascii)
                 // See: <https://learn.microsoft.com/en-us/typography/opentype/spec/otff#organization-of-an-opentype-font>
-                [b'O', b'T', b'T', b'O', ..] => FontFaceSourceFormatKeyword::Opentype,
+                b"OTTO" => FontFaceSourceFormatKeyword::Opentype,
                 // Opentype fonts truetype outlines begin with 0x00010000
                 // See: <https://learn.microsoft.com/en-us/typography/opentype/spec/otff#organization-of-an-opentype-font>
-                [0x00, 0x01, 0x00, 0x00, ..] => FontFaceSourceFormatKeyword::Truetype,
+                &[0x00, 0x01, 0x00, 0x00] => FontFaceSourceFormatKeyword::Truetype,
                 // Truetype fonts begin with 0x74727565 ('true' in ascii)
                 // See: <https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6.html#ScalerTypeNote>
-                [b't', b'r', b'u', b'e', ..] => FontFaceSourceFormatKeyword::Truetype,
+                b"true" => FontFaceSourceFormatKeyword::Truetype,
                 _ => FontFaceSourceFormatKeyword::None,
             }
         }
@@ -199,21 +195,26 @@ impl NetHandler<Resource> for FontFaceHandler {
         let mut bytes = bytes;
 
         match self.0 {
-            // #[cfg(feature = "woff-c")]
-            // FontFaceSourceFormatKeyword::Woff => {
-            //     #[cfg(feature = "tracing")]
-            //     tracing::info!("Decompressing woff1 font");
+            #[cfg(any(feature = "woff-c", feature = "woff-rust"))]
+            FontFaceSourceFormatKeyword::Woff => {
+                #[cfg(feature = "tracing")]
+                tracing::info!("Decompressing woff1 font");
 
-            //     // Use woff crate to decompress font
-            //     let decompressed = woff::version1::decompress(&bytes);
+                // Use woff crate to decompress font
+                #[cfg(feature = "woff-c")]
+                let decompressed = woff::version1::decompress(&bytes);
 
-            //     if let Some(decompressed) = decompressed {
-            //         bytes = Bytes::from(decompressed);
-            //     } else {
-            //         #[cfg(feature = "tracing")]
-            //         tracing::warn!("Failed to decompress woff1 font");
-            //     }
-            // }
+                // Use wuff crate to decompress font
+                #[cfg(feature = "woff-rust")]
+                let decompressed = wuff::decompress_woff1(&bytes).ok();
+
+                if let Some(decompressed) = decompressed {
+                    bytes = Bytes::from(decompressed);
+                } else {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!("Failed to decompress woff1 font");
+                }
+            }
             #[cfg(any(feature = "woff-c", feature = "woff-rust"))]
             FontFaceSourceFormatKeyword::Woff2 => {
                 #[cfg(feature = "tracing")]
@@ -223,9 +224,9 @@ impl NetHandler<Resource> for FontFaceHandler {
                 #[cfg(feature = "woff-c")]
                 let decompressed = woff::version2::decompress(&bytes);
 
-                // Use woff2 crate to decompress font
+                // Use wuff crate to decompress font
                 #[cfg(feature = "woff-rust")]
-                let decompressed = woff2::decode::convert_woff2_to_ttf(&mut bytes).ok();
+                let decompressed = wuff::decompress_woff2(&bytes).ok();
 
                 if let Some(decompressed) = decompressed {
                     bytes = Bytes::from(decompressed);
@@ -251,6 +252,7 @@ fn fetch_font_face(
     read_guard: &SharedRwLockReadGuard,
 ) {
     sheet
+        .contents(read_guard)
         .rules(read_guard)
         .iter()
         .filter_map(|rule| match rule {

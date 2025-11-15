@@ -6,12 +6,18 @@ use anyrender::WindowRenderer;
 
 #[cfg(feature = "gpu")]
 pub use anyrender_vello::{
-    CustomPaintSource, VelloWindowRenderer as InnerRenderer,
+    CustomPaintSource, VelloRendererOptions, VelloWindowRenderer as InnerRenderer,
     wgpu::{Features, Limits},
 };
 
 #[cfg(feature = "cpu-base")]
 use anyrender_vello_cpu::VelloCpuWindowRenderer as InnerRenderer;
+
+#[cfg(feature = "hybrid")]
+use anyrender_vello_hybrid::VelloHybridWindowRenderer as InnerRenderer;
+
+#[cfg(feature = "skia")]
+use anyrender_skia::SkiaWindowRenderer as InnerRenderer;
 
 #[cfg(feature = "gpu")]
 pub fn use_wgpu<T: CustomPaintSource>(create_source: impl FnOnce() -> T) -> u64 {
@@ -51,7 +57,11 @@ impl DxnWindowRenderer {
 
     #[cfg(feature = "gpu")]
     pub fn with_features_and_limits(features: Option<Features>, limits: Option<Limits>) -> Self {
-        let vello_renderer = InnerRenderer::with_features_and_limits(features, limits);
+        let vello_renderer = InnerRenderer::with_options(VelloRendererOptions {
+            features,
+            limits,
+            ..VelloRendererOptions::default()
+        });
         Self::with_inner_renderer(vello_renderer)
     }
 

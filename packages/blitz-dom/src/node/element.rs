@@ -1,6 +1,7 @@
 use cssparser::ParserInput;
+use linebender_resource_handle::Blob;
 use markup5ever::{LocalName, QualName, local_name};
-use parley::{FontContext, LayoutContext};
+use parley::{ContentWidths, FontContext, LayoutContext};
 use selectors::matching::QuirksMode;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -375,21 +376,21 @@ impl ElementData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RasterImageData {
     /// The width of the image
     pub width: u32,
     /// The height of the image
     pub height: u32,
     /// The raw image data in RGBA8 format
-    pub data: Arc<Vec<u8>>,
+    pub data: Blob<u8>,
 }
 impl RasterImageData {
     pub fn new(width: u32, height: u32, data: Arc<Vec<u8>>) -> Self {
         Self {
             width,
             height,
-            data,
+            data: Blob::new(data),
         }
     }
 }
@@ -525,7 +526,7 @@ impl std::fmt::Debug for ListItemLayout {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-/// Parley Brush type for Blitz which contains a `peniko::Brush` and a Blitz node id
+/// Parley Brush type for Blitz which contains the Blitz node id
 pub struct TextBrush {
     /// The node id for the span
     pub id: usize,
@@ -537,10 +538,23 @@ impl TextBrush {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TextLayout {
     pub text: String,
+    pub content_widths: Option<ContentWidths>,
     pub layout: parley::layout::Layout<TextBrush>,
+}
+
+impl TextLayout {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn content_widths(&mut self) -> ContentWidths {
+        *self
+            .content_widths
+            .get_or_insert_with(|| self.layout.calculate_content_widths())
+    }
 }
 
 impl std::fmt::Debug for TextLayout {

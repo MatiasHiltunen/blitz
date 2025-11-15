@@ -72,6 +72,11 @@ pub fn process_ref_test(
         &ref_html,
     );
 
+    let image_is_blank = ctx.buffers.test_buffer.iter().all(|x| *x == 0);
+    if image_is_blank {
+        return SubtestCounts::ZERO_OF_ONE;
+    }
+
     if ctx.buffers.test_buffer == ctx.buffers.ref_buffer {
         return SubtestCounts::ONE_OF_ONE;
     }
@@ -110,7 +115,7 @@ fn render_html_to_buffer(
 
     // Render document to RGBA buffer
     let buf = ctx.buffers.get_mut(buffer_kind);
-    ctx.renderer.render(
+    ctx.renderer.render_to_vec(
         |scene| paint_scene(scene, document.as_ref(), SCALE, WIDTH, HEIGHT),
         buf,
     );
