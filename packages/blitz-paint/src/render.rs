@@ -31,12 +31,12 @@ use style::{
     },
     values::{
         computed::{CSSPixelLength, Overflow},
-        generics::basic_shape::{ByTo, GenericPathOrShapeFunction, GenericShapeCommand, Path},
+        generics::basic_shape::{GenericPathOrShapeFunction, GenericShapeCommand},
         specified::{BorderStyle, OutlineStyle, image::ImageRendering},
     },
 };
 
-use kurbo::{self, Affine, BezPath, Insets, PathEl, Point, Rect, Shape, Stroke, Vec2};
+use kurbo::{self, Affine, BezPath, Insets, Point, Rect, Shape, Stroke, Vec2};
 use peniko::{self, Fill, ImageData, ImageSampler};
 use style::values::computed::{
     angle::Angle,
@@ -46,10 +46,11 @@ use style::values::computed::{
 };
 use style::values::generics::{
     basic_shape::{
-        GenericBasicShape, GenericClipPath, InsetRect, ShapeBox, ShapeGeometryBox, ShapeRadius,
+        CommandEndPoint, GenericBasicShape, GenericClipPath, InsetRect, ShapeBox, ShapeGeometryBox,
+        ShapeRadius,
     },
     color::GenericColor,
-    position::GenericPositionOrAuto,
+    position::{GenericPosition, GenericPositionOrAuto},
 };
 use taffy::Layout;
 
@@ -61,28 +62,18 @@ use taffy::Layout;
  * This function implements the conversion of parameters from endpoint to center
  * parametrization as described in the section B.2.4 in the same document.
  */
-fn stylo_to_kurbo(
+fn stylo_to_kurbo_arc(
     start: Point,
-    end: &CoordinatePair<f32>,
-    radii: &CoordinatePair<f32>,
-    arc_sweep: &ArcSweep,
-    arc_size: &ArcSize,
+    end: Point,
+    radii: Vec2,
+    arc_sweep: ArcSweep,
+    arc_size: ArcSize,
     x_axis_rotation: f64,
 ) -> kurbo::Arc {
-    let end = Point {
-        x: end.x as f64,
-        y: end.y as f64,
-    };
-    let rx = radii.x as f64;
-    let ry = radii.y as f64;
-    let sweep = match &arc_sweep {
-        ArcSweep::Ccw => false,
-        ArcSweep::Cw => true,
-    };
-    let large_arc = match &arc_size {
-        ArcSize::Large => true,
-        ArcSize::Small => false,
-    };
+    let rx = radii.x;
+    let ry = radii.y;
+    let sweep = matches!(arc_sweep, ArcSweep::Cw);
+    let large_arc = matches!(arc_size, ArcSize::Large);
     let phi = x_axis_rotation.to_radians();
 
     // Step1: Compute (x1', y1')
@@ -139,123 +130,156 @@ pub fn angle(u: Vec2, v: Vec2) -> f64 {
     sign * (u.dot(v) / (u.length() * v.length())).acos()
 }
 
-fn stylo_to_kurbo_path(cmds: &[GenericShapeCommand<f32, f32>]) -> Vec<PathEl> {
-    // let cmds = p.commands();
-    let num_commands = cmds.len();
-    let mut result = vec![];
-    let mut prev_point: Option<Point> = None;
-    for i in 0..num_commands {
-        let cmd = &cmds[i];
+fn commands_to_bez_path(cmds: &[GenericShapeCommand<f32, f32>]) -> BezPath {
+    let mut path = BezPath::new();
+    let mut current_point = Point::new(0.0, 0.0);
+    let mut subpath_start = Point::new(0.0, 0.0);
+    let mut has_started = false;
+    let mut last_quad_ctrl: Option<Point> = None;
+    let mut last_cubic_ctrl: Option<Point> = None;
+
+    for cmd in cmds {
         match cmd {
-            GenericShapeCommand::Move { by_to, point } => {
-                let x = point.x as f64;
-                let y = point.y as f64;
-                let point = Point { x, y };
-                prev_point = Some(point);
-                result.push(PathEl::MoveTo(point));
+            GenericShapeCommand::Move { point } => {
+                let target = resolve_endpoint_absolute(point, current_point);
+                path.move_to(target);
+                current_point = target;
+                subpath_start = target;
+                has_started = true;
+                last_quad_ctrl = None;
+                last_cubic_ctrl = None;
             }
-            GenericShapeCommand::Line { by_to, point } => {
-                let x = point.x as f64;
-                let y = point.y as f64;
-                let point = Point { x, y };
-                prev_point = Some(point);
-                result.push(PathEl::LineTo(point));
-            }
-            GenericShapeCommand::VLine { by_to, y } => {
-                let y = *y as f64;
-                if let Some(prev) = prev_point {
-                    let point = Point { x: prev.x, y };
-                    prev_point = Some(point);
-                    result.push(PathEl::LineTo(point));
-                } else {
-                    let point = Point { x: 0.0, y };
-                    prev_point = Some(point);
-                    result.push(PathEl::LineTo(point));
-                }
+            GenericShapeCommand::Line { point } => {
+                let target = resolve_endpoint_absolute(point, current_point);
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.line_to(target);
+                current_point = target;
+                last_quad_ctrl = None;
+                last_cubic_ctrl = None;
             }
             GenericShapeCommand::HLine { by_to, x } => {
-                let x = *x as f64;
-                if let Some(prev) = prev_point {
-                    let point = Point { x, y: prev.y };
-                    prev_point = Some(point);
-                    result.push(PathEl::LineTo(point));
+                let target = if by_to.is_abs() {
+                    Point {
+                        x: *x as f64,
+                        y: current_point.y,
+                    }
                 } else {
-                    let point = Point { x, y: 0.0 };
-                    prev_point = Some(point);
-                    result.push(PathEl::LineTo(point));
-                }
+                    Point {
+                        x: current_point.x + *x as f64,
+                        y: current_point.y,
+                    }
+                };
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.line_to(target);
+                current_point = target;
+                last_quad_ctrl = None;
+                last_cubic_ctrl = None;
             }
-            GenericShapeCommand::Close => {
-                result.push(PathEl::ClosePath);
+            GenericShapeCommand::VLine { by_to, y } => {
+                let target = if by_to.is_abs() {
+                    Point {
+                        x: current_point.x,
+                        y: *y as f64,
+                    }
+                } else {
+                    Point {
+                        x: current_point.x,
+                        y: current_point.y + *y as f64,
+                    }
+                };
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.line_to(target);
+                current_point = target;
+                last_quad_ctrl = None;
+                last_cubic_ctrl = None;
             }
             GenericShapeCommand::Arc {
-                by_to,
                 point,
                 radii,
                 arc_sweep,
                 arc_size,
                 rotate,
             } => {
-                if let Some(start_point) = prev_point {
-                    let kurbo_arc = stylo_to_kurbo(
-                        start_point,
-                        point,
-                        radii,
-                        arc_sweep,
-                        arc_size,
-                        *rotate as f64,
-                    );
-                    let bez_arc = kurbo_arc.to_path(1e-3);
-                    bez_arc.iter().for_each(|seg| result.push(seg));
+                let target = resolve_endpoint_absolute(point, current_point);
+                let arc = stylo_to_kurbo_arc(
+                    current_point,
+                    target,
+                    Vec2 {
+                        x: radii.x as f64,
+                        y: radii.y as f64,
+                    },
+                    *arc_sweep,
+                    *arc_size,
+                    *rotate as f64,
+                );
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                for el in arc.to_path(1e-3) {
+                    match el {
+                        kurbo::PathEl::MoveTo(_) => {}
+                        _ => path.push(el),
+                    }
                 }
+                current_point = target;
+                last_quad_ctrl = None;
+                last_cubic_ctrl = None;
             }
-            GenericShapeCommand::QuadCurve {
-                by_to,
-                point,
-                control1,
-            } => {
-                let end = Point {
-                    x: point.x as f64,
-                    y: point.y as f64,
-                };
-                let control = Point {
-                    x: control1.x as f64,
-                    y: control1.y as f64,
-                };
-                result.push(PathEl::QuadTo(end, control));
+            GenericShapeCommand::QuadCurve { point, control1 } => {
+                let control = coordinate_pair_to_point(control1);
+                let target = resolve_endpoint_absolute(point, current_point);
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.quad_to(control, target);
+                current_point = target;
+                last_quad_ctrl = Some(control);
+                last_cubic_ctrl = None;
             }
             GenericShapeCommand::CubicCurve {
-                by_to,
                 point,
                 control1,
                 control2,
             } => {
-                let end = Point {
-                    x: point.x as f64,
-                    y: point.y as f64,
-                };
-                let control1 = Point {
-                    x: control1.x as f64,
-                    y: control1.y as f64,
-                };
-                let control2 = Point {
-                    x: control2.x as f64,
-                    y: control2.y as f64,
-                };
-                result.push(PathEl::CurveTo(end, control1, control2));
+                let control_one = coordinate_pair_to_point(control1);
+                let control_two = coordinate_pair_to_point(control2);
+                let target = resolve_endpoint_absolute(point, current_point);
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.curve_to(control_one, control_two, target);
+                current_point = target;
+                last_cubic_ctrl = Some(control_two);
+                last_quad_ctrl = None;
             }
-            // I guess this means the control point should be placed such that the tangent to the
-            // curve at the starting point must be overlapping the slope of the curve before the start
-            // point. I don't know how to do this
-            GenericShapeCommand::SmoothQuad { by_to, point } => {}
-            GenericShapeCommand::SmoothCubic {
-                by_to,
-                point,
-                control2,
-            } => {}
+            GenericShapeCommand::SmoothQuad { point } => {
+                let control = last_quad_ctrl
+                    .map(|ctrl| reflect_point(ctrl, current_point))
+                    .unwrap_or(current_point);
+                let target = resolve_endpoint_absolute(point, current_point);
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.quad_to(control, target);
+                current_point = target;
+                last_quad_ctrl = Some(control);
+                last_cubic_ctrl = None;
+            }
+            GenericShapeCommand::SmoothCubic { point, control2 } => {
+                let control_one = last_cubic_ctrl
+                    .map(|ctrl| reflect_point(ctrl, current_point))
+                    .unwrap_or(current_point);
+                let control_two = coordinate_pair_to_point(control2);
+                let target = resolve_endpoint_absolute(point, current_point);
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.curve_to(control_one, control_two, target);
+                current_point = target;
+                last_cubic_ctrl = Some(control_two);
+                last_quad_ctrl = None;
+            }
+            GenericShapeCommand::Close => {
+                ensure_path_started(&mut path, &mut has_started, current_point);
+                path.close_path();
+                current_point = subpath_start;
+                last_quad_ctrl = None;
+                last_cubic_ctrl = None;
+            }
         }
     }
-    result
+
+    path
 }
 
 /// A short-lived struct which holds a bunch of parameters for rendering a scene so
@@ -607,8 +631,8 @@ impl BlitzDomPainter<'_> {
 
                 let x0 = origin_x + left;
                 let y0 = origin_y + top;
-                let x1 = origin_x + right;
-                let y1 = origin_y + bottom;
+                let x1 = origin_x + box_width - right;
+                let y1 = origin_y + box_height - bottom;
 
                 let r_top_left = resolve_non_negative_length_percentage_value(
                     rect.round.top_left.0.width(),
@@ -635,42 +659,6 @@ impl BlitzDomPainter<'_> {
                     (r_top_left, r_top_right, r_bottom_right, r_bottom_left),
                 ))
             }
-            GenericBasicShape::Inset(inset) => {
-                let top = resolve_length_percentage_value(&inset.rect.0, box_height);
-                let right = resolve_length_percentage_value(&inset.rect.1, box_width);
-                let bottom = resolve_length_percentage_value(&inset.rect.2, box_height);
-                let left = resolve_length_percentage_value(&inset.rect.3, box_width);
-
-                let x0 = origin_x + left;
-                let y0 = origin_y + top;
-                let x1 = origin_x + box_width - right;
-                let y1 = origin_y + box_height - bottom;
-
-                let r_top_left = resolve_non_negative_length_percentage_value(
-                    inset.round.top_left.0.width(),
-                    box_width,
-                );
-                let r_top_right = resolve_non_negative_length_percentage_value(
-                    inset.round.top_right.0.width(),
-                    box_width,
-                );
-                let r_bottom_right = resolve_non_negative_length_percentage_value(
-                    inset.round.bottom_right.0.width(),
-                    box_width,
-                );
-                let r_bottom_left = resolve_non_negative_length_percentage_value(
-                    inset.round.bottom_left.0.width(),
-                    box_width,
-                );
-
-                Some(frame.rect_path(
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                    (r_top_left, r_top_right, r_bottom_right, r_bottom_left),
-                ))
-            }
             GenericBasicShape::Polygon(polygon) => {
                 let points: Vec<Point> = polygon
                     .coordinates
@@ -683,222 +671,17 @@ impl BlitzDomPainter<'_> {
                 Some(frame.polygon_path(&points))
             }
             GenericBasicShape::PathOrShape(path) => {
-                let base_path = match path {
-                    GenericPathOrShapeFunction::Path(p) => {
-                        let cmds = p.commands();
-                        stylo_to_kurbo_path(cmds)
-                    }
+                let mut path = match path {
+                    GenericPathOrShapeFunction::Path(p) => commands_to_bez_path(p.commands()),
                     GenericPathOrShapeFunction::Shape(s) => {
-                        let cmds = s.commands();
-                        let mut commands: Vec<GenericShapeCommand<f32, f32>> = Vec::new();
-                        for cmd_ref in cmds.iter() {
-                            let cmd = cmd_ref.clone();
-                            match cmd {
-                                GenericShapeCommand::Move { by_to, point } => {
-                                    let point = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (point
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (point
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-                                    commands.push(GenericShapeCommand::Move { by_to, point })
-                                }
-                                GenericShapeCommand::Line { by_to, point } => {
-                                    let point = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (point
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (point
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-                                    commands.push(GenericShapeCommand::Line { by_to, point })
-                                }
-                                GenericShapeCommand::VLine { by_to, y } => {
-                                    let y = (box_height as f32)
-                                        * (y.to_percentage().unwrap_or_default().to_percentage());
-                                    commands.push(GenericShapeCommand::VLine { by_to, y })
-                                }
-                                GenericShapeCommand::HLine { by_to, x } => {
-                                    let x = (box_width as f32)
-                                        * (x.to_percentage().unwrap_or_default().to_percentage());
-                                    commands.push(GenericShapeCommand::HLine { by_to, x })
-                                }
-                                GenericShapeCommand::Arc {
-                                    by_to,
-                                    point,
-                                    radii,
-                                    arc_sweep,
-                                    arc_size,
-                                    rotate,
-                                } => {
-                                    let point = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (point
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (point
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-
-                                    let radii = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (radii
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (radii
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-
-                                    let rotate = rotate.degrees();
-                                    commands.push(GenericShapeCommand::Arc {
-                                        by_to,
-                                        point,
-                                        radii,
-                                        arc_sweep,
-                                        arc_size,
-                                        rotate,
-                                    });
-                                }
-                                GenericShapeCommand::QuadCurve {
-                                    by_to,
-                                    point,
-                                    control1,
-                                } => {
-                                    let point = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (point
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (point
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-
-                                    let control1 = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (control1
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (control1
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-                                    commands.push(GenericShapeCommand::QuadCurve {
-                                        by_to,
-                                        point,
-                                        control1,
-                                    });
-                                }
-                                GenericShapeCommand::CubicCurve {
-                                    by_to,
-                                    point,
-                                    control1,
-                                    control2,
-                                } => {
-                                    let point = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (point
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (point
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-
-                                    let control1 = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (control1
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (control1
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-
-                                    let control2 = CoordinatePair::new(
-                                        (box_width as f32)
-                                            * (control2
-                                                .x
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                        (box_height as f32)
-                                            * (control2
-                                                .y
-                                                .to_percentage()
-                                                .unwrap_or_default()
-                                                .to_percentage()),
-                                    );
-                                    commands.push(GenericShapeCommand::CubicCurve {
-                                        by_to,
-                                        point,
-                                        control1,
-                                        control2,
-                                    });
-                                }
-                                GenericShapeCommand::Close => {
-                                    commands.push(GenericShapeCommand::Close);
-                                }
-                                GenericShapeCommand::SmoothQuad { .. } => {}
-                                GenericShapeCommand::SmoothCubic { .. } => {}
-                            }
-                        }
-                        stylo_to_kurbo_path(&commands)
+                        let cmds =
+                            convert_shape_commands_to_absolute(s.commands(), box_width, box_height);
+                        commands_to_bez_path(&cmds)
                     }
                 };
-
-                let mut path = frame.path_from_path_vec(base_path);
                 path.apply_affine(Affine::translate((origin_x, origin_y)));
                 Some(path)
             }
-            _ => None,
         }
     }
 
@@ -1539,5 +1322,128 @@ fn resolve_shape_radius(
             ];
             distances.iter().fold(0.0, |acc, value| acc.max(*value))
         }
+    }
+}
+
+fn convert_shape_commands_to_absolute(
+    commands: &[GenericShapeCommand<Angle, LengthPercentage>],
+    box_width: f64,
+    box_height: f64,
+) -> Vec<GenericShapeCommand<f32, f32>> {
+    commands
+        .iter()
+        .map(|cmd| match cmd {
+            GenericShapeCommand::Move { point } => GenericShapeCommand::Move {
+                point: convert_command_endpoint(point, box_width, box_height),
+            },
+            GenericShapeCommand::Line { point } => GenericShapeCommand::Line {
+                point: convert_command_endpoint(point, box_width, box_height),
+            },
+            GenericShapeCommand::HLine { by_to, x } => GenericShapeCommand::HLine {
+                by_to: *by_to,
+                x: resolve_length_percentage_value(x, box_width) as f32,
+            },
+            GenericShapeCommand::VLine { by_to, y } => GenericShapeCommand::VLine {
+                by_to: *by_to,
+                y: resolve_length_percentage_value(y, box_height) as f32,
+            },
+            GenericShapeCommand::CubicCurve {
+                point,
+                control1,
+                control2,
+            } => GenericShapeCommand::CubicCurve {
+                point: convert_command_endpoint(point, box_width, box_height),
+                control1: coordinate_pair_to_f32(control1, box_width, box_height),
+                control2: coordinate_pair_to_f32(control2, box_width, box_height),
+            },
+            GenericShapeCommand::QuadCurve { point, control1 } => GenericShapeCommand::QuadCurve {
+                point: convert_command_endpoint(point, box_width, box_height),
+                control1: coordinate_pair_to_f32(control1, box_width, box_height),
+            },
+            GenericShapeCommand::SmoothCubic { point, control2 } => {
+                GenericShapeCommand::SmoothCubic {
+                    point: convert_command_endpoint(point, box_width, box_height),
+                    control2: coordinate_pair_to_f32(control2, box_width, box_height),
+                }
+            }
+            GenericShapeCommand::SmoothQuad { point } => GenericShapeCommand::SmoothQuad {
+                point: convert_command_endpoint(point, box_width, box_height),
+            },
+            GenericShapeCommand::Arc {
+                point,
+                radii,
+                arc_sweep,
+                arc_size,
+                rotate,
+            } => GenericShapeCommand::Arc {
+                point: convert_command_endpoint(point, box_width, box_height),
+                radii: coordinate_pair_to_f32(radii, box_width, box_height),
+                arc_sweep: *arc_sweep,
+                arc_size: *arc_size,
+                rotate: rotate.degrees(),
+            },
+            GenericShapeCommand::Close => GenericShapeCommand::Close,
+        })
+        .collect()
+}
+
+fn convert_command_endpoint(
+    endpoint: &CommandEndPoint<LengthPercentage>,
+    box_width: f64,
+    box_height: f64,
+) -> CommandEndPoint<f32> {
+    match endpoint {
+        CommandEndPoint::ToPosition(pos) => CommandEndPoint::ToPosition(GenericPosition {
+            horizontal: resolve_length_percentage_value(&pos.horizontal, box_width) as f32,
+            vertical: resolve_length_percentage_value(&pos.vertical, box_height) as f32,
+        }),
+        CommandEndPoint::ByCoordinate(coord) => {
+            CommandEndPoint::ByCoordinate(coordinate_pair_to_f32(coord, box_width, box_height))
+        }
+    }
+}
+
+fn coordinate_pair_to_f32(
+    pair: &CoordinatePair<LengthPercentage>,
+    box_width: f64,
+    box_height: f64,
+) -> CoordinatePair<f32> {
+    CoordinatePair {
+        x: resolve_length_percentage_value(&pair.x, box_width) as f32,
+        y: resolve_length_percentage_value(&pair.y, box_height) as f32,
+    }
+}
+
+fn coordinate_pair_to_point(pair: &CoordinatePair<f32>) -> Point {
+    Point {
+        x: pair.x as f64,
+        y: pair.y as f64,
+    }
+}
+
+fn resolve_endpoint_absolute(point: &CommandEndPoint<f32>, current: Point) -> Point {
+    match point {
+        CommandEndPoint::ToPosition(position) => Point {
+            x: position.horizontal as f64,
+            y: position.vertical as f64,
+        },
+        CommandEndPoint::ByCoordinate(coord) => Point {
+            x: current.x + coord.x as f64,
+            y: current.y + coord.y as f64,
+        },
+    }
+}
+
+fn ensure_path_started(path: &mut BezPath, has_started: &mut bool, current: Point) {
+    if !*has_started {
+        path.move_to(current);
+        *has_started = true;
+    }
+}
+
+fn reflect_point(control: Point, center: Point) -> Point {
+    Point {
+        x: 2.0 * center.x - control.x,
+        y: 2.0 * center.y - control.y,
     }
 }
