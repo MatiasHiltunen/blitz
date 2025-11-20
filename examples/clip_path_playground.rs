@@ -91,7 +91,7 @@ fn app() -> Element {
             div { class: "controls",
                 h1 { "Clip-Path Playground" }
                 h2 { "Shape builder" }
-                label { "Shape" }
+                label { class: "field-label", "Shape" }
                 select {
                     value: shape_kind(),
                     onchange: move |e| *shape_kind.write() = e.value(),
@@ -272,19 +272,20 @@ fn app() -> Element {
                                     onclick: move |_| *shape_margin_value.write() = value.to_string(),
                                     "{label}"
                                 }
-                            }
-                        }
-                        div { class: "shape-margin-stage",
-                            div {
-                                class: "float-shape",
-                                style: "clip-path: {clip_path_value()}; shape-outside: {clip_path_value()}; shape-margin: {shape_margin_value()};",
-                                img { class: "float-image", src: "{image_url()}", alt: "Floating shape" }
-                            }
-                            p { class: "demo-copy",
-                                "Frenchman belongs to a small set of Parisian sportsmen, who have taken up \"ballooning\" as a pastime. After having exhausted all the sensations that are to be found in ordinary sports, even those of \"automobiling\" at a breakneck speed, the members now seek in the air the nerve-racking excitement that they have ceased to find on earth. Adjust the values to see the margin expand or contract the wrap."
-                            }
                         }
                     }
+                    div { class: "shape-margin-stage",
+                        div {
+                            class: "float-shape",
+                            style: "clip-path: {clip_path_value()}; shape-outside: {clip_path_value()}; shape-margin: {shape_margin_value()};",
+                            img { class: "float-image", src: "{image_url()}", alt: "Floating shape" }
+                        }
+                        p { class: "demo-copy",
+                            "Frenchman belongs to a small set of Parisian sportsmen, who have taken up \"ballooning\" as a pastime. After having exhausted all the sensations that are to be found in ordinary sports, even those of \"automobiling\" at a breakneck speed, the members now seek in the air the nerve-racking excitement that they have ceased to find on earth. Adjust the values to see the margin expand or contract the wrap."
+                        }
+                        p { class: "support-note", "Note: shape-outside wrapping is currently box-based in Blitz; true shape contours require engine support." }
+                    }
+                }
                 }
 
                 div { class: "css-output",
@@ -334,6 +335,11 @@ body {
   color: #cbd5e1;
 }
 
+.controls label {
+  display: block;
+  font-weight: 600;
+}
+
 .slider,
 .split {
   display: flex;
@@ -356,6 +362,7 @@ body {
 
 label {
   font-size: 0.9rem;
+  display: block;
 }
 
 select,
@@ -372,7 +379,37 @@ input[type="range"],
 
 input[type="range"] {
   padding: 0;
-  height: 6px;
+  height: 10px;
+  background: #1e293b;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #3b82f6;
+  border: 1px solid #1e293b;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 10px;
+  border-radius: 6px;
+  background: #1f2937;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #3b82f6;
+  border: 1px solid #1e293b;
+}
+
+input[type="range"]::-moz-range-track {
+  height: 10px;
+  border-radius: 6px;
+  background: #1f2937;
 }
 
 .text {
@@ -544,6 +581,12 @@ input[type="range"] {
   content: "";
   display: block;
   clear: both;
+}
+
+.support-note {
+  color: #9aa6b6;
+  font-size: 0.85rem;
+  margin-top: 8px;
 }
 
 .css-output {
