@@ -870,6 +870,7 @@ dependencies = [
  "blitz-dom",
  "blitz-traits",
  "color",
+ "cssparser",
  "euclid",
  "kurbo 0.12.0",
  "parley",

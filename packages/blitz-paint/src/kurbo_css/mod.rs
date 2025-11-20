@@ -75,4 +75,3 @@ fn get_corner_insets(insets: Insets, corner: Corner) -> Vec2 {
         },
     }
 }
-

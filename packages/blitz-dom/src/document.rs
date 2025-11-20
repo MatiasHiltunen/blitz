@@ -532,7 +532,7 @@ impl BaseDocument {
         if let Ok(absolute_url) = url::Url::parse(raw) {
             return absolute_url;
         }
-        
+
         // If that fails, try to resolve relative to the base URL
         self.url.resolve_relative(raw).unwrap_or_else(|| {
             panic!(
@@ -557,7 +557,7 @@ impl BaseDocument {
             }
             return Ok(absolute_url);
         }
-        
+
         // If that fails, try to resolve relative to the base URL
         self.url.resolve_relative(raw).ok_or(())
     }

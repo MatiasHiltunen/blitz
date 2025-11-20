@@ -40,7 +40,6 @@ pub struct CssBox {
 
     pub padding_width: Insets,
     pub border_width: Insets,
-    pub margin_width: Insets,
     pub outline_width: f64,
 
     pub border_radii: NonUniformRoundedRectRadii,
@@ -94,7 +93,6 @@ impl CssBox {
             outline_width,
             padding_width: padding,
             border_width: border,
-            margin_width: margin,
             border_radii,
         }
     }
@@ -218,11 +216,6 @@ impl CssBox {
 
     pub fn ellipse_path(&self, center: Point, radii: Vec2) -> BezPath {
         let path = Ellipse::new(center, radii, 0.0).to_path(BezPath::TOLERANCE);
-        path
-    }
-
-    pub fn path_from_path_vec(&self, path: Vec<PathEl>) -> BezPath {
-        let path = BezPath::from_vec(path);
         path
     }
 
@@ -622,4 +615,3 @@ fn should_solve_properly() {
     // 0.643501
     dbg!(start_angle(4.0, 1.0, Vec2 { x: 1.0, y: 2.0 }));
 }
-

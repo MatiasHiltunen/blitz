@@ -12,6 +12,7 @@ rust-version.workspace = true
 
 [features]
 default = [
+    "floats",
     "svg",
     "woff-rust",
     "accessibility",

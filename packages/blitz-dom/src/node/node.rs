@@ -21,6 +21,7 @@ use style::properties::generated::longhands::position::computed_value::T as Posi
 use style::selector_parser::{PseudoElement, RestyleDamage};
 use style::stylesheets::UrlExtraData;
 use style::values::computed::Display as StyloDisplay;
+use style::values::generics::basic_shape::GenericClipPath;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::{data::ElementData as StyloElementData, shared_lock::SharedRwLock};
 use style_dom::ElementState;
@@ -785,10 +786,15 @@ impl Node {
         // TODO: mix-blend-mode
         // TODO: transforms
         // TODO: filter
-        // TODO: clip-path
         // TODO: mask
         // TODO: isolation
         // TODO: contain
+
+        // clip-path creates a stacking context when it clips content
+        let clip_path = style.clone_clip_path();
+        if !matches!(clip_path, GenericClipPath::None) {
+            return true;
+        }
 
         false
     }

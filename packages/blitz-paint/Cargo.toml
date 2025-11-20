@@ -38,3 +38,4 @@ usvg = { workspace = true, optional = true }
 
 # Other dependencies
 tracing = { workspace = true, optional = true }
+cssparser = { workspace = true }

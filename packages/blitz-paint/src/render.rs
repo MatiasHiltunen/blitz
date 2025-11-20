@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use crate::color::{Color, ToColorColor};
 use crate::debug_overlay::render_debug_overlay;
+use crate::kurbo_css::{CssBox, Edge, NonUniformRoundedRectRadii};
 use crate::layers::maybe_with_layer;
 use crate::sizing::compute_object_fit;
 use anyrender::{CustomPaint, Paint, PaintScene};
@@ -17,9 +18,9 @@ use blitz_dom::node::{
     TextNodeData,
 };
 use blitz_dom::{BaseDocument, ElementData, Node, local_name};
-use crate::kurbo_css::{CssBox, Edge, NonUniformRoundedRectRadii};
 use blitz_traits::devtools::DevtoolSettings;
 
+use cssparser::{Parser, ParserInput, Token};
 use euclid::Transform3D;
 use style::values::computed::BorderCornerRadius;
 use style::values::computed::length_percentage::Unpacked;
@@ -599,7 +600,7 @@ impl BlitzDomPainter<'_> {
         let stylo_clip_path: StyloClipPath = styles.clone_clip_path();
 
         let reference_rect = frame.border_box;
-        let shape_margin = resolve_shape_margin(styles, reference_rect);
+        let shape_margin = resolve_shape_margin_for_node(node, reference_rect);
 
         let path = match stylo_clip_path {
             GenericClipPath::None => None,
@@ -661,7 +662,13 @@ impl BlitzDomPainter<'_> {
                 ShapeBox::ContentBox => frame.content_box_path(),
                 ShapeBox::MarginBox => frame.margin_box_path(),
             },
-            _ => frame.border_box_path(),
+            // For now, map SVG-specific boxes (fill-box, stroke-box, view-box) and
+            // element-dependent defaults to the border box for HTML elements. This
+            // keeps behavior aligned with the spec default while we lack SVG layout.
+            ShapeGeometryBox::FillBox
+            | ShapeGeometryBox::StrokeBox
+            | ShapeGeometryBox::ViewBox
+            | ShapeGeometryBox::ElementDependent => frame.border_box_path(),
         }
     }
 
@@ -677,7 +684,10 @@ impl BlitzDomPainter<'_> {
                 ShapeBox::ContentBox => frame.content_box,
                 ShapeBox::MarginBox => frame.margin_box,
             },
-            _ => frame.border_box,
+            ShapeGeometryBox::FillBox
+            | ShapeGeometryBox::StrokeBox
+            | ShapeGeometryBox::ViewBox
+            | ShapeGeometryBox::ElementDependent => frame.border_box,
         }
     }
 
@@ -706,7 +716,7 @@ impl BlitzDomPainter<'_> {
                 let radius =
                     resolve_shape_radius(&circle.radius, center, reference_rect, box_width);
                 let total_radius = radius + shape_margin;
-                
+
                 // Create the path even if radius is zero/negative - we'll check area later
                 Some(frame.circle_path(center, total_radius.max(0.0)))
             }
@@ -718,7 +728,7 @@ impl BlitzDomPainter<'_> {
                 let radius_y =
                     resolve_shape_radius(&ellipse.semiaxis_y, center, reference_rect, box_height)
                         + shape_margin;
-                
+
                 // Create the path even if radii are zero/negative - we'll check area later
                 Some(frame.ellipse_path(
                     center,
@@ -775,7 +785,7 @@ impl BlitzDomPainter<'_> {
                     x: origin_x + box_width / 2.0,
                     y: origin_y + box_height / 2.0,
                 };
-                
+
                 let points: Vec<Point> = polygon
                     .coordinates
                     .iter()
@@ -787,27 +797,32 @@ impl BlitzDomPainter<'_> {
                         expand_polygon_point(base_point, bounding_box_center, shape_margin)
                     })
                     .collect();
-                
+
                 // Create the path even if degenerate - we'll check area later
                 Some(frame.polygon_path(&points))
             }
             GenericBasicShape::PathOrShape(path) => {
-                let mut path = match path {
-                    GenericPathOrShapeFunction::Path(p) => commands_to_bez_path(p.commands()),
+                let path = match path {
+                    // CSS path() authoring is typically 0..1 relative to the reference box.
+                    // Scale to the reference box size, then translate to its origin.
+                    GenericPathOrShapeFunction::Path(p) => {
+                        let mut pth = commands_to_bez_path(p.commands());
+                        pth.apply_affine(
+                            Affine::scale_non_uniform(box_width, box_height)
+                                .then_translate(Vec2::new(origin_x, origin_y)),
+                        );
+                        pth
+                    }
+                    // CSS shape() commands are already resolved into absolute lengths/percentages.
                     GenericPathOrShapeFunction::Shape(s) => {
                         let cmds =
                             convert_shape_commands_to_absolute(s.commands(), box_width, box_height);
-                        commands_to_bez_path(&cmds)
+                        let mut pth = commands_to_bez_path(&cmds);
+                        pth.apply_affine(Affine::translate((origin_x, origin_y)));
+                        pth
                     }
                 };
-                
-                // Path coordinates are in normalized 0-1 range, so we need to scale them
-                // to the reference rect dimensions, then translate to the correct position
-                path.apply_affine(
-                    Affine::translate((origin_x, origin_y))
-                        .pre_scale_non_uniform(box_width, box_height)
-                );
-                
+
                 Some(path)
             }
         }
@@ -1304,7 +1319,8 @@ impl ElementCx<'_> {
             BorderStyle::None | BorderStyle::Hidden => return,
             BorderStyle::Dotted | BorderStyle::Dashed => {
                 // Use stroke for dotted/dashed borders
-                let (dash_length, gap_length, cap) = if matches!(border_style, BorderStyle::Dotted) {
+                let (dash_length, gap_length, cap) = if matches!(border_style, BorderStyle::Dotted)
+                {
                     // Dotted: use small circular dots (width determines size)
                     // Per CSS spec, dots are circular (round caps) with equal dash and gap
                     let dot_size = border_width.max(1.0);
@@ -1327,8 +1343,12 @@ impl ElementCx<'_> {
 
                 sb.stroke(&stroke, self.transform, color, None, &path);
             }
-            BorderStyle::Solid | BorderStyle::Double | BorderStyle::Groove 
-            | BorderStyle::Ridge | BorderStyle::Inset | BorderStyle::Outset => {
+            BorderStyle::Solid
+            | BorderStyle::Double
+            | BorderStyle::Groove
+            | BorderStyle::Ridge
+            | BorderStyle::Inset
+            | BorderStyle::Outset => {
                 // Use fill for solid borders (and fallback for unimplemented styles)
                 sb.fill(Fill::NonZero, self.transform, color, None, &path);
             }
@@ -1360,7 +1380,7 @@ impl ElementCx<'_> {
         };
 
         let outline_width = self.frame.outline_width;
-        
+
         match style {
             BorderStyle::None | BorderStyle::Hidden => return,
             BorderStyle::Dotted | BorderStyle::Dashed => {
@@ -1534,19 +1554,15 @@ const DEFAULT_SHAPE_MARGIN: f64 = 0.0;
 /// The expansion is done by scaling the point away from the bounding box center.
 /// This is a simple approximation; a more accurate implementation would expand
 /// perpendicular to the polygon edge, but this approach works well for most cases.
-fn expand_polygon_point(
-    point: Point,
-    bounding_box_center: Point,
-    margin: f64,
-) -> Point {
+fn expand_polygon_point(point: Point, bounding_box_center: Point, margin: f64) -> Point {
     if margin <= 0.0 {
         return point;
     }
-    
+
     let dx = point.x - bounding_box_center.x;
     let dy = point.y - bounding_box_center.y;
     let dist = (dx * dx + dy * dy).sqrt();
-    
+
     if dist > 0.0 {
         let scale = (dist + margin) / dist;
         Point {
@@ -1558,20 +1574,49 @@ fn expand_polygon_point(
     }
 }
 
-/// Resolves the shape-margin CSS property value.
+/// Resolves the shape-margin value.
 ///
-/// **Current Status**: Stylo 0.9.0 does not expose `shape-margin` in `ComputedValues`,
-/// so this function returns the CSS default of `0.0`. The infrastructure to apply
-/// `shape-margin` exists in `basic_shape_to_path` and will automatically work once
-/// Stylo adds support.
-///
-/// **Future**: When Stylo exposes `shape-margin`, update this to:
-/// ```rust
-/// let margin = styles.get_box().shape_margin;
-/// resolve_non_negative_length_percentage_value(&margin, reference_rect.width())
-/// ```
-fn resolve_shape_margin(_styles: &ComputedValues, _reference_rect: Rect) -> f64 {
-    DEFAULT_SHAPE_MARGIN
+/// Stylo 0.9.0 doesn’t expose `shape-margin` in `ComputedValues` for Servo, so we
+/// implement a lightweight parser that understands inline style declarations:
+/// `style="shape-margin: 12px"` or percentages (resolved against the reference
+/// rect width). Unknown or negative values fall back to the CSS default of 0.
+fn resolve_shape_margin_for_node(node: &Node, reference_rect: Rect) -> f64 {
+    let Some(style_attr) = node.attr(local_name!("style")) else {
+        return DEFAULT_SHAPE_MARGIN;
+    };
+
+    let margin_value = style_attr.split(';').find_map(|decl| {
+        let mut parts = decl.splitn(2, ':');
+        let name = parts.next()?.trim();
+        let value = parts.next()?.trim();
+        if name.eq_ignore_ascii_case("shape-margin") {
+            Some(value)
+        } else {
+            None
+        }
+    });
+
+    let Some(raw_value) = margin_value else {
+        return DEFAULT_SHAPE_MARGIN;
+    };
+
+    parse_shape_margin_value(raw_value, reference_rect).unwrap_or(DEFAULT_SHAPE_MARGIN)
+}
+
+fn parse_shape_margin_value(raw_value: &str, reference_rect: Rect) -> Option<f64> {
+    let mut input = ParserInput::new(raw_value);
+    let mut parser = Parser::new(&mut input);
+
+    let px_value = match parser.next() {
+        Ok(Token::Percentage { unit_value, .. }) => reference_rect.width() * *unit_value as f64,
+        Ok(Token::Dimension { value, unit, .. }) if unit.eq_ignore_ascii_case("px") => {
+            *value as f64
+        }
+        Ok(Token::Number { value, .. }) => *value as f64, // treat unitless as px for convenience
+        _ => return None,
+    };
+
+    Some(px_value.max(0.0))
 }
 
 fn convert_shape_commands_to_absolute(
@@ -1700,32 +1745,24 @@ fn reflect_point(control: Point, center: Point) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use style::properties::ComputedValues;
-    use style::properties::style_structs::Font;
-    use style::values::computed::length_percentage::Unpacked;
     use style::values::computed::Percentage;
+    use style::values::computed::length_percentage::Unpacked;
     use style::values::generics::basic_shape::ShapeRadius;
 
     #[test]
-    fn test_resolve_shape_margin_returns_default() {
-        // Test that resolve_shape_margin returns 0.0 (CSS default)
-        // since Stylo doesn't expose shape-margin
-        let styles = ComputedValues::initial_values_with_font_override(Font::initial_values());
+    fn test_parse_shape_margin_returns_none_for_empty() {
         let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
-        
-        let margin = resolve_shape_margin(&styles, reference_rect);
-        
-        // Should return CSS default of 0.0
-        assert_eq!(margin, 0.0, "shape-margin should default to 0.0 per CSS spec");
+        let margin = parse_shape_margin_value("", reference_rect);
+        assert!(margin.is_none());
     }
 
     #[test]
     fn test_resolve_unpacked_value_length() {
         let unpacked = Unpacked::Length(CSSPixelLength::new(42.0));
         let axis = 100.0;
-        
+
         let result = resolve_unpacked_value(unpacked, axis);
-        
+
         assert_eq!(result, 42.0, "Length value should be resolved correctly");
     }
 
@@ -1733,10 +1770,13 @@ mod tests {
     fn test_resolve_unpacked_value_percentage() {
         let unpacked = Unpacked::Percentage(Percentage(0.5));
         let axis = 200.0;
-        
+
         let result = resolve_unpacked_value(unpacked, axis);
-        
-        assert_eq!(result, 100.0, "Percentage value should be resolved correctly (50% of 200 = 100)");
+
+        assert_eq!(
+            result, 100.0,
+            "Percentage value should be resolved correctly (50% of 200 = 100)"
+        );
     }
 
     #[test]
@@ -1747,10 +1787,13 @@ mod tests {
         let center = Point::new(25.0, 25.0);
         let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
         let axis = 100.0;
-        
+
         let result = resolve_shape_radius(&radius, center, reference_rect, axis);
-        
-        assert_eq!(result, 25.0, "ClosestSide should return minimum distance to any edge");
+
+        assert_eq!(
+            result, 25.0,
+            "ClosestSide should return minimum distance to any edge"
+        );
     }
 
     #[test]
@@ -1761,62 +1804,53 @@ mod tests {
         let center = Point::new(25.0, 25.0);
         let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
         let axis = 100.0;
-        
+
         let result = resolve_shape_radius(&radius, center, reference_rect, axis);
-        
-        assert_eq!(result, 75.0, "FarthestSide should return maximum distance to any edge");
+
+        assert_eq!(
+            result, 75.0,
+            "FarthestSide should return maximum distance to any edge"
+        );
     }
 
     #[test]
     fn test_resolve_shape_position_auto() {
         let position = GenericPositionOrAuto::Auto;
         let reference_rect = Rect::new(10.0, 20.0, 110.0, 120.0);
-        
+
         let result = resolve_shape_position(position, reference_rect);
-        
+
         // Auto should center at (10 + 50, 20 + 50) = (60, 70)
         let expected = Point::new(60.0, 70.0);
-        assert_eq!(result.x, expected.x, "Auto position should center horizontally");
-        assert_eq!(result.y, expected.y, "Auto position should center vertically");
+        assert_eq!(
+            result.x, expected.x,
+            "Auto position should center horizontally"
+        );
+        assert_eq!(
+            result.y, expected.y,
+            "Auto position should center vertically"
+        );
     }
 
     #[test]
-    fn test_resolve_shape_margin_with_different_rect_sizes() {
-        // Test that resolve_shape_margin handles different reference rect sizes
-        // (even though it currently always returns 0.0)
-        let styles = ComputedValues::initial_values_with_font_override(Font::initial_values());
-        
-        let small_rect = Rect::new(0.0, 0.0, 10.0, 10.0);
-        let large_rect = Rect::new(0.0, 0.0, 1000.0, 1000.0);
-        
-        let margin_small = resolve_shape_margin(&styles, small_rect);
-        let margin_large = resolve_shape_margin(&styles, large_rect);
-        
-        // Both should return 0.0 (CSS default)
-        assert_eq!(margin_small, 0.0);
-        assert_eq!(margin_large, 0.0);
-        assert_eq!(margin_small, margin_large, "Should return same default regardless of rect size");
+    fn test_parse_shape_margin_px() {
+        let reference_rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let parsed = parse_shape_margin_value("15px", reference_rect).unwrap();
+        assert_eq!(parsed, 15.0);
     }
 
     #[test]
-    fn test_shape_margin_infrastructure_ready() {
-        // Test that the infrastructure exists to use shape_margin values
-        // This test verifies that when shape_margin is provided, it would be used correctly
-        
-        // Create a simple reference rect
-        let _reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
-        
-        // Test different margin values
-        let margins: Vec<f64> = vec![0.0, 5.0, 10.0, 20.0];
-        
-        for margin in margins {
-            // Verify margin values are valid (non-negative per CSS spec)
-            assert!(margin >= 0.0, "shape-margin must be non-negative per CSS spec");
-            
-            // When shape_margin is implemented, these values would be used to expand shapes
-            // For now, we just verify the values are valid
-            assert!(margin.is_finite(), "shape-margin must be finite");
-        }
+    fn test_parse_shape_margin_percentage() {
+        let reference_rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let parsed = parse_shape_margin_value("10%", reference_rect).unwrap();
+        assert_eq!(parsed, 20.0);
+    }
+
+    #[test]
+    fn test_parse_shape_margin_invalid() {
+        let reference_rect = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let parsed = parse_shape_margin_value("bogus", reference_rect);
+        assert!(parsed.is_none());
     }
 
     #[test]
@@ -1824,22 +1858,31 @@ mod tests {
         // Test edge cases for shape radius resolution
         let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
         let axis = 100.0;
-        
+
         // Center at exact center
         let center_center = Point::new(50.0, 50.0);
         let radius_closest = ShapeRadius::ClosestSide;
         let result = resolve_shape_radius(&radius_closest, center_center, reference_rect, axis);
-        assert_eq!(result, 50.0, "Center point should have equal distance to all sides");
-        
+        assert_eq!(
+            result, 50.0,
+            "Center point should have equal distance to all sides"
+        );
+
         // Center at corner
         let center_corner = Point::new(0.0, 0.0);
         let result = resolve_shape_radius(&radius_closest, center_corner, reference_rect, axis);
-        assert_eq!(result, 0.0, "Corner point should have 0 distance to closest side");
-        
+        assert_eq!(
+            result, 0.0,
+            "Corner point should have 0 distance to closest side"
+        );
+
         // Center at edge
         let center_edge = Point::new(0.0, 50.0);
         let result = resolve_shape_radius(&radius_closest, center_edge, reference_rect, axis);
-        assert_eq!(result, 0.0, "Edge point should have 0 distance to closest side");
+        assert_eq!(
+            result, 0.0,
+            "Edge point should have 0 distance to closest side"
+        );
     }
 
     #[test]
@@ -1847,9 +1890,9 @@ mod tests {
         // Test edge case: zero axis
         let unpacked = Unpacked::Percentage(Percentage(0.5));
         let axis = 0.0;
-        
+
         let result = resolve_unpacked_value(unpacked, axis);
-        
+
         assert_eq!(result, 0.0, "Percentage of zero axis should be zero");
     }
 
@@ -1860,10 +1903,13 @@ mod tests {
         let center = Point::new(0.0, 0.0);
         let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
         let axis = 100.0;
-        
+
         let result = resolve_shape_radius(&radius, center, reference_rect, axis);
-        
-        assert_eq!(result, 0.0, "Center at origin should have 0 distance to closest side");
+
+        assert_eq!(
+            result, 0.0,
+            "Center at origin should have 0 distance to closest side"
+        );
     }
 
     #[test]
@@ -1883,7 +1929,7 @@ mod tests {
         let center = Point::new(50.0, 50.0);
         let margin = 5.0;
         let expanded = expand_polygon_point(point, center, margin);
-        
+
         // Should be 15 units right of center (10 + 5)
         assert_eq!(expanded.x, 65.0);
         assert_eq!(expanded.y, 50.0);
@@ -1896,7 +1942,7 @@ mod tests {
         let center = Point::new(50.0, 50.0);
         let margin = 10.0;
         let expanded = expand_polygon_point(point, center, margin);
-        
+
         // Point at center should remain unchanged
         assert_eq!(expanded.x, point.x);
         assert_eq!(expanded.y, point.y);
@@ -1909,15 +1955,22 @@ mod tests {
         let center = Point::new(50.0, 50.0);
         let margin = 5.0;
         let expanded = expand_polygon_point(point, center, margin);
-        
+
         // Should maintain direction but increase distance
         let original_dist = ((point.x - center.x).powi(2) + (point.y - center.y).powi(2)).sqrt();
-        let expanded_dist = ((expanded.x - center.x).powi(2) + (expanded.y - center.y).powi(2)).sqrt();
-        assert!((expanded_dist - (original_dist + margin)).abs() < 1e-10, "Distance should increase by margin");
-        
+        let expanded_dist =
+            ((expanded.x - center.x).powi(2) + (expanded.y - center.y).powi(2)).sqrt();
+        assert!(
+            (expanded_dist - (original_dist + margin)).abs() < 1e-10,
+            "Distance should increase by margin"
+        );
+
         // Direction should be preserved (ratio should be same)
         let original_ratio = (point.y - center.y) / (point.x - center.x);
         let expanded_ratio = (expanded.y - center.y) / (expanded.x - center.x);
-        assert!((original_ratio - expanded_ratio).abs() < 1e-10, "Direction should be preserved");
+        assert!(
+            (original_ratio - expanded_ratio).abs() < 1e-10,
+            "Direction should be preserved"
+        );
     }
 }
