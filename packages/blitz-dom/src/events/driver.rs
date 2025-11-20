@@ -119,7 +119,14 @@ impl<'doc, Handler: EventHandler> EventDriver<'doc, Handler> {
             self.handler
                 .handle_event(&chain, &mut event, &mut self.mutr, &mut event_state);
 
-            if !event_state.is_cancelled() {
+            // Always process keyboard events for input elements, even if Dioxus handled them,
+            // to ensure clipboard shortcuts (Cmd+V, Cmd+C, etc.) work correctly
+            let should_process_dom = !event_state.is_cancelled() || matches!(
+                &event.data,
+                DomEventData::KeyDown(_) | DomEventData::KeyUp(_) | DomEventData::KeyPress(_)
+            );
+
+            if should_process_dom {
                 self.doc_mut()
                     .handle_dom_event(&mut event, |new_evt| queue.push_back(new_evt));
             }

@@ -123,9 +123,85 @@ impl ShellProvider for BlitzShellProvider {
         )
     ))]
     fn get_clipboard_text(&self) -> Result<String, blitz_traits::shell::ClipboardError> {
-        let mut cb = arboard::Clipboard::new().unwrap();
-        cb.get_text()
-            .map_err(|_| blitz_traits::shell::ClipboardError)
+        eprintln!("[DEBUG] get_clipboard_text() called");
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        
+        // Try arboard first
+        eprintln!("[DEBUG] Attempting to create clipboard with arboard...");
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        
+        match arboard::Clipboard::new() {
+            Ok(mut cb) => {
+                eprintln!("[DEBUG] Clipboard created successfully, attempting get_text()...");
+                std::io::Write::flush(&mut std::io::stderr()).ok();
+                match cb.get_text() {
+                    Ok(text) => {
+                        eprintln!("[DEBUG] Clipboard::get_text() succeeded, text length: {}", text.len());
+                        Ok(text)
+                    }
+                    Err(e) => {
+                        eprintln!("[DEBUG] Clipboard::get_text() failed with error");
+                        eprintln!("[DEBUG] Error: {:?}", e);
+                        std::io::Write::flush(&mut std::io::stderr()).ok();
+                        
+                        // Fallback to macOS pbpaste command
+                        #[cfg(target_os = "macos")]
+                        {
+                            eprintln!("[DEBUG] Attempting fallback to pbpaste...");
+                            std::io::Write::flush(&mut std::io::stderr()).ok();
+                            match std::process::Command::new("pbpaste")
+                                .output()
+                            {
+                                Ok(output) => {
+                                    if output.status.success() {
+                                        let text = String::from_utf8_lossy(&output.stdout).to_string();
+                                        eprintln!("[DEBUG] pbpaste succeeded, text length: {}", text.len());
+                                        return Ok(text);
+                                    } else {
+                                        eprintln!("[DEBUG] pbpaste failed with status: {:?}", output.status);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[DEBUG] pbpaste command failed: {:?}", e);
+                                }
+                            }
+                        }
+                        
+                        Err(blitz_traits::shell::ClipboardError)
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[DEBUG] Clipboard::new() failed");
+                eprintln!("[DEBUG] Error: {:?}", e);
+                std::io::Write::flush(&mut std::io::stderr()).ok();
+                
+                // Fallback to macOS pbpaste command
+                #[cfg(target_os = "macos")]
+                {
+                    eprintln!("[DEBUG] Attempting fallback to pbpaste...");
+                    std::io::Write::flush(&mut std::io::stderr()).ok();
+                    match std::process::Command::new("pbpaste")
+                        .output()
+                    {
+                        Ok(output) => {
+                            if output.status.success() {
+                                let text = String::from_utf8_lossy(&output.stdout).to_string();
+                                eprintln!("[DEBUG] pbpaste succeeded, text length: {}", text.len());
+                                return Ok(text);
+                            } else {
+                                eprintln!("[DEBUG] pbpaste failed with status: {:?}", output.status);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[DEBUG] pbpaste command failed: {:?}", e);
+                        }
+                    }
+                }
+                
+                Err(blitz_traits::shell::ClipboardError)
+            }
+        }
     }
 
     #[cfg(all(

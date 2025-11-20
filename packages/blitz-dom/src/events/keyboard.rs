@@ -6,7 +6,7 @@ use blitz_traits::{
     events::{BlitzInputEvent, BlitzKeyEvent, DomEvent, DomEventData},
     shell::ShellProvider,
 };
-use keyboard_types::{Key, Modifiers};
+use keyboard_types::{Code, Key, Modifiers};
 use markup5ever::local_name;
 use parley::{FontContext, LayoutContext};
 
@@ -27,38 +27,36 @@ pub(crate) fn handle_keypress<F: FnMut(DomEvent)>(
         return;
     }
 
-    if let Some(node_id) = doc.focus_node_id {
-        if target != node_id {
-            return;
-        }
+    // Use the focused node if available, otherwise use the target from the event
+    // This ensures keyboard shortcuts work even if the event target doesn't match exactly
+    let node_id = doc.focus_node_id.unwrap_or(target);
 
-        let node = &mut doc.nodes[node_id];
-        let Some(element_data) = node.element_data_mut() else {
-            return;
-        };
+    let node = &mut doc.nodes[node_id];
+    let Some(element_data) = node.element_data_mut() else {
+        return;
+    };
 
-        if let Some(input_data) = element_data.text_input_data_mut() {
-            let generated_event = apply_keypress_event(
-                input_data,
-                &mut doc.font_ctx.lock().unwrap(),
-                &mut doc.layout_ctx,
-                &*doc.shell_provider,
-                event,
-            );
+    if let Some(input_data) = element_data.text_input_data_mut() {
+        let generated_event = apply_keypress_event(
+            input_data,
+            &mut doc.font_ctx.lock().unwrap(),
+            &mut doc.layout_ctx,
+            &*doc.shell_provider,
+            event,
+        );
 
-            if let Some(generated_event) = generated_event {
-                match generated_event {
-                    GeneratedEvent::Input => {
-                        let value = input_data.editor.raw_text().to_string();
-                        dispatch_event(DomEvent::new(
-                            node_id,
-                            DomEventData::Input(BlitzInputEvent { value }),
-                        ));
-                    }
-                    GeneratedEvent::Submit => {
-                        // TODO: Generate submit event that can be handled by script
-                        implicit_form_submission(doc, target);
-                    }
+        if let Some(generated_event) = generated_event {
+            match generated_event {
+                GeneratedEvent::Input => {
+                    let value = input_data.editor.raw_text().to_string();
+                    dispatch_event(DomEvent::new(
+                        node_id,
+                        DomEventData::Input(BlitzInputEvent { value }),
+                    ));
+                }
+                GeneratedEvent::Submit => {
+                    // TODO: Generate submit event that can be handled by script
+                    implicit_form_submission(doc, target);
                 }
             }
         }
@@ -89,29 +87,59 @@ fn apply_keypress_event(
     let is_multiline = input_data.is_multiline;
     let editor = &mut input_data.editor;
     let mut driver = editor.driver(font_ctx, layout_ctx);
-    match event.key {
-        Key::Character(c) if action_mod && matches!(c.as_str(), "c" | "x" | "v") => {
-            match c.to_lowercase().as_str() {
-                "c" => {
-                    if let Some(text) = driver.editor.selected_text() {
-                        let _ = shell_provider.set_clipboard_text(text.to_owned());
-                    }
+    
+    // Handle clipboard shortcuts (Cmd+C, Cmd+X, Cmd+V)
+    // Check both the key character and the code to handle different key representations
+    if action_mod {
+        let key_char = match &event.key {
+            Key::Character(c) => Some(c.as_str()),
+            _ => None,
+        };
+        
+        // Debug: print what we're detecting
+        eprintln!("[DEBUG] action_mod=true, key={:?}, code={:?}, key_char={:?}", event.key, event.code, key_char);
+        
+        // Also check the code for V, C, X keys
+        let is_v = key_char == Some("v") || event.code == Code::KeyV;
+        let is_c = key_char == Some("c") || event.code == Code::KeyC;
+        let is_x = key_char == Some("x") || event.code == Code::KeyX;
+        
+        eprintln!("[DEBUG] is_v={}, is_c={}, is_x={}", is_v, is_c, is_x);
+        
+        if is_v {
+            eprintln!("[DEBUG] Cmd+V detected, attempting paste");
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+            
+            match shell_provider.get_clipboard_text() {
+                Ok(text) => {
+                    eprintln!("[DEBUG] Pasting text: {} ({} chars)", text.chars().take(20).collect::<String>(), text.len());
+                    std::io::Write::flush(&mut std::io::stderr()).ok();
+                    driver.insert_or_replace_selection(&text);
+                    return Some(GeneratedEvent::Input);
                 }
-                "x" => {
-                    if let Some(text) = driver.editor.selected_text() {
-                        let _ = shell_provider.set_clipboard_text(text.to_owned());
-                        driver.delete_selection()
-                    }
+                Err(_e) => {
+                    eprintln!("[DEBUG] Clipboard access failed - error returned from get_clipboard_text()");
+                    std::io::Write::flush(&mut std::io::stderr()).ok();
+                    // Clipboard access failed, silently ignore
+                    return None;
                 }
-                "v" => {
-                    let text = shell_provider.get_clipboard_text().unwrap_or_default();
-                    driver.insert_or_replace_selection(&text)
-                }
-                _ => unreachable!(),
             }
-
-            return Some(GeneratedEvent::Input);
+        } else if is_c {
+            if let Some(text) = driver.editor.selected_text() {
+                let _ = shell_provider.set_clipboard_text(text.to_owned());
+            }
+            return None; // Copy doesn't generate input event
+        } else if is_x {
+            if let Some(text) = driver.editor.selected_text() {
+                let _ = shell_provider.set_clipboard_text(text.to_owned());
+                driver.delete_selection();
+                return Some(GeneratedEvent::Input);
+            }
+            return None;
         }
+    }
+    
+    match event.key {
         Key::Character(c) if action_mod && matches!(c.to_lowercase().as_str(), "a") => {
             if shift {
                 driver.collapse_selection()
