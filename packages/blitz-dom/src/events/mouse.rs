@@ -18,6 +18,82 @@ pub(crate) fn handle_mousemove(
 ) -> bool {
     let mut changed = doc.set_hover_to(x, y);
 
+    // If buttons are pressed and there's a focused input field, continue extending selection
+    // even when mouse moves outside the input bounds
+    if buttons != MouseEventButtons::None {
+        if let Some(focused_node_id) = doc.focus_node_id {
+            // Get node layout info before borrowing mutably
+            let (content_box_offset, node_x, node_y, node_width, node_height) = {
+                let node = &doc.nodes[focused_node_id];
+                (
+                    taffy::Point {
+                        x: node.final_layout.padding.left + node.final_layout.border.left,
+                        y: node.final_layout.padding.top + node.final_layout.border.top,
+                    },
+                    node.final_layout.content_box_x(),
+                    node.final_layout.content_box_y(),
+                    node.final_layout.content_box_width(),
+                    node.final_layout.content_box_height(),
+                )
+            };
+
+            // First, do hit test to check if we're over the input
+            let hit_result = doc.hit(x, y);
+
+            // Calculate coordinates
+            let (rel_x, rel_y) = if let Some(hit) = hit_result {
+                if hit.node_id == focused_node_id {
+                    // Mouse is over the input, use hit coordinates
+                    (hit.x, hit.y)
+                } else {
+                    // Mouse is outside, clamp to input bounds
+                    let abs_x = x / doc.viewport.scale_f64() as f32;
+                    let abs_y = y / doc.viewport.scale_f64() as f32;
+                    
+                    let clamped_x = (abs_x - node_x - content_box_offset.x)
+                        .max(0.0)
+                        .min(node_width);
+                    let clamped_y = (abs_y - node_y - content_box_offset.y)
+                        .max(0.0)
+                        .min(node_height);
+                    
+                    (clamped_x, clamped_y)
+                }
+            } else {
+                // Mouse is outside, clamp to input bounds
+                let abs_x = x / doc.viewport.scale_f64() as f32;
+                let abs_y = y / doc.viewport.scale_f64() as f32;
+                
+                let clamped_x = (abs_x - node_x - content_box_offset.x)
+                    .max(0.0)
+                    .min(node_width);
+                let clamped_y = (abs_y - node_y - content_box_offset.y)
+                    .max(0.0)
+                    .min(node_height);
+                
+                (clamped_x, clamped_y)
+            };
+
+            // Now borrow mutably to extend selection
+            let node = &mut doc.nodes[focused_node_id];
+            if let Some(el) = node.data.downcast_element_mut() {
+                if let SpecialElementData::TextInput(ref mut text_input_data) = el.special_data {
+                    let scaled_x = (rel_x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
+                    let scaled_y = (rel_y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
+
+                    text_input_data
+                        .editor
+                        .driver(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx)
+                        .extend_selection_to_point(scaled_x as f32, scaled_y as f32);
+
+                    changed = true;
+                    return changed;
+                }
+            }
+        }
+    }
+
+    // Original behavior: only extend selection when mouse is over the input
     let Some(hit) = doc.hit(x, y) else {
         return changed;
     };
@@ -86,13 +162,32 @@ pub(crate) fn handle_mousedown(doc: &mut BaseDocument, target: usize, x: f32, y:
         let x = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
         let y = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
 
-        text_input_data
-            .editor
-            .driver(&mut doc.font_ctx.lock().unwrap(), &mut doc.layout_ctx)
-            .move_to_point(x as f32, y as f32);
+        // On mousedown, collapse selection first, then move cursor
+        // This ensures we place the cursor instead of starting a selection
+        {
+            let mut font_ctx = doc.font_ctx.lock().unwrap();
+            let mut driver = text_input_data.editor.driver(&mut font_ctx, &mut doc.layout_ctx);
+            driver.collapse_selection();
+            driver.move_to_point(x as f32, y as f32);
+        }
 
         doc.set_focus_to(hit.node_id);
     }
+}
+
+// Helper function to check if a node is a text input or is inside a text input
+fn is_text_input_or_inside(doc: &BaseDocument, node_id: usize) -> bool {
+    let mut current_id = Some(node_id);
+    while let Some(id) = current_id {
+        let node = &doc.nodes[id];
+        if let Some(el) = node.data.downcast_element() {
+            if matches!(el.special_data, SpecialElementData::TextInput(_)) {
+                return true;
+            }
+        }
+        current_id = node.parent;
+    }
+    false
 }
 
 pub(crate) fn handle_mouseup<F: FnMut(DomEvent)>(
@@ -101,6 +196,111 @@ pub(crate) fn handle_mouseup<F: FnMut(DomEvent)>(
     event: &BlitzMouseButtonEvent,
     mut dispatch_event: F,
 ) {
+    // If there's a focused input field and we're releasing the mouse button,
+    // finalize the selection only if mousedown was inside the input (text selection operation)
+    if event.button == MouseEventButton::Main {
+        if let Some(focused_node_id) = doc.focus_node_id {
+            // Only finalize selection if mousedown was inside the input
+            // This distinguishes text selection (mousedown inside) from clicking outside (mousedown outside)
+            let mousedown_was_inside = doc.mousedown_node_id
+                .map(|id| is_text_input_or_inside(doc, id))
+                .unwrap_or(false);
+            
+            if mousedown_was_inside {
+                // First, do hit test before borrowing mutably
+                let hit_result = doc.hit(event.x, event.y);
+                
+                // Get layout info before borrowing mutably
+                let (content_box_offset, node_x, node_y, node_width, node_height) = {
+                    let node = &doc.nodes[focused_node_id];
+                    (
+                        taffy::Point {
+                            x: node.final_layout.padding.left + node.final_layout.border.left,
+                            y: node.final_layout.padding.top + node.final_layout.border.top,
+                        },
+                        node.final_layout.content_box_x(),
+                        node.final_layout.content_box_y(),
+                        node.final_layout.content_box_width(),
+                        node.final_layout.content_box_height(),
+                    )
+                };
+                
+                // Now borrow mutably to finalize selection
+                let node = &mut doc.nodes[focused_node_id];
+                if let Some(el) = node.data.downcast_element_mut() {
+                    if let SpecialElementData::TextInput(ref mut text_input_data) = el.special_data {
+                        // Calculate final selection point
+                        let (scaled_x, scaled_y) = if let Some(hit) = hit_result {
+                            if hit.node_id == focused_node_id {
+                                // Mouse is over the input, use hit coordinates
+                                let x = (hit.x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
+                                let y = (hit.y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
+                                (x, y)
+                            } else {
+                                // Mouse is outside input, clamp to input bounds
+                                let abs_x = event.x / doc.viewport.scale_f64() as f32;
+                                let abs_y = event.y / doc.viewport.scale_f64() as f32;
+                                
+                                let clamped_x = if abs_x < node_x {
+                                    0.0
+                                } else if abs_x > node_x + node_width {
+                                    node_width
+                                } else {
+                                    (abs_x - node_x - content_box_offset.x).max(0.0).min(node_width)
+                                };
+                                
+                                let clamped_y = if abs_y < node_y {
+                                    0.0
+                                } else if abs_y > node_y + node_height {
+                                    node_height
+                                } else {
+                                    (abs_y - node_y - content_box_offset.y).max(0.0).min(node_height)
+                                };
+                                
+                                let x = (clamped_x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
+                                let y = (clamped_y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
+                                (x, y)
+                            }
+                        } else {
+                            // Mouse is outside any element, clamp to input bounds based on direction
+                            let abs_x = event.x / doc.viewport.scale_f64() as f32;
+                            let abs_y = event.y / doc.viewport.scale_f64() as f32;
+                            
+                            let clamped_x = if abs_x < node_x {
+                                0.0
+                            } else if abs_x > node_x + node_width {
+                                node_width
+                            } else {
+                                (abs_x - node_x - content_box_offset.x).max(0.0).min(node_width)
+                            };
+                            
+                            let clamped_y = if abs_y < node_y {
+                                0.0
+                            } else if abs_y > node_y + node_height {
+                                node_height
+                            } else {
+                                (abs_y - node_y - content_box_offset.y).max(0.0).min(node_height)
+                            };
+                            
+                            let x = (clamped_x - content_box_offset.x) as f64 * doc.viewport.scale_f64();
+                            let y = (clamped_y - content_box_offset.y) as f64 * doc.viewport.scale_f64();
+                            (x, y)
+                        };
+                        
+                        // Finalize selection
+                        {
+                            let mut font_ctx = doc.font_ctx.lock().unwrap();
+                            let mut driver = text_input_data.editor.driver(&mut font_ctx, &mut doc.layout_ctx);
+                            driver.extend_selection_to_point(scaled_x as f32, scaled_y as f32);
+                        }
+                        
+                        doc.shell_provider.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
     if doc.devtools().highlight_hover {
         let mut node = doc.get_node(target).unwrap();
         if event.button == MouseEventButton::Secondary {
@@ -256,6 +456,55 @@ pub(crate) fn handle_click<F: FnMut(DomEvent)>(
         maybe_node_id = doc.nodes[node_id].parent;
     }
 
-    // If nothing is matched then clear focus
+    // If nothing is matched, handle text input focus/selection
+    // Only clear selection/focus if BOTH mousedown AND click target are outside the focused input
+    // This prevents clearing selection after text selection (mousedown inside, mouseup outside)
+    if let Some(focused_id) = doc.focus_node_id {
+        // Check if the focused node is a text input
+        let is_focused_text_input = {
+            let node = &doc.nodes[focused_id];
+            node.data.downcast_element()
+                .map(|el| matches!(el.special_data, SpecialElementData::TextInput(_)))
+                .unwrap_or(false)
+        };
+        
+        if is_focused_text_input {
+            // Check if click target is outside the input
+            let click_target_is_outside = !is_text_input_or_inside(doc, target);
+            
+            // Check if mousedown was inside the input
+            let mousedown_was_inside = doc.mousedown_node_id
+                .map(|id| is_text_input_or_inside(doc, id))
+                .unwrap_or(false);
+            
+            // Clear focus if:
+            // 1. Click target is outside AND mousedown was outside (full click outside)
+            // 2. Click target is outside AND mousedown_node_id is None (can't determine, but click is outside)
+            // This preserves focus during text selection (mousedown inside, mouseup outside)
+            if click_target_is_outside && !mousedown_was_inside {
+                // Clear selection first
+                {
+                    let node = &mut doc.nodes[focused_id];
+                    if let Some(el) = node.data.downcast_element_mut() {
+                        if let SpecialElementData::TextInput(ref mut text_input_data) = el.special_data {
+                            let mut font_ctx = doc.font_ctx.lock().unwrap();
+                            let mut driver = text_input_data.editor.driver(&mut font_ctx, &mut doc.layout_ctx);
+                            driver.collapse_selection();
+                        }
+                    }
+                }
+                // Clear focus (which will remove the cursor)
+                doc.clear_focus();
+                return;
+            } else if mousedown_was_inside {
+                // Mousedown was inside (text selection) - preserve focus and selection
+                return;
+            }
+            // If click target is inside, preserve focus (fall through to return at end)
+            return;
+        }
+    }
+    
+    // Clear focus for non-text-input elements or when no text input is focused
     doc.clear_focus();
 }
