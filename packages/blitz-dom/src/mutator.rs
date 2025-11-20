@@ -690,8 +690,19 @@ impl<'doc> DocumentMutator<'doc> {
     fn load_image(&mut self, target_id: usize) {
         let node = &self.doc.nodes[target_id];
         if let Some(raw_src) = node.attr(local_name!("src")) {
-            if !raw_src.is_empty() {
-                let src = self.doc.resolve_url(raw_src);
+            if raw_src.is_empty() {
+                return;
+            }
+            
+            // Skip partial URLs that are clearly invalid (e.g., "https://", "http:", etc.)
+            // These occur when the user is typing or deleting characters
+            let trimmed = raw_src.trim();
+            if trimmed.ends_with("://") || (trimmed.ends_with(':') && !trimmed.contains('/')) {
+                return;
+            }
+            
+            // Try to resolve the URL, but don't panic if it fails
+            if let Ok(src) = self.doc.try_resolve_url(raw_src) {
                 self.doc.net_provider.fetch(
                     self.doc.id(),
                     Request::get(src),

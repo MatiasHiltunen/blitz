@@ -528,12 +528,38 @@ impl BaseDocument {
     }
 
     pub(crate) fn resolve_url(&self, raw: &str) -> url::Url {
+        // First try to parse as an absolute URL (e.g., https://, http://, data:, etc.)
+        if let Ok(absolute_url) = url::Url::parse(raw) {
+            return absolute_url;
+        }
+        
+        // If that fails, try to resolve relative to the base URL
         self.url.resolve_relative(raw).unwrap_or_else(|| {
             panic!(
                 "to be able to resolve {raw} with the base_url: {:?}",
                 *self.url
             )
         })
+    }
+
+    /// Try to resolve a URL, returning None if it cannot be resolved.
+    /// This is a non-panicking version of `resolve_url` for cases where
+    /// invalid URLs should be handled gracefully (e.g., during user input).
+    pub(crate) fn try_resolve_url(&self, raw: &str) -> Result<url::Url, ()> {
+        // First try to parse as an absolute URL (e.g., https://, http://, data:, etc.)
+        if let Ok(absolute_url) = url::Url::parse(raw) {
+            // Validate that the URL has a valid scheme and host (for http/https)
+            // This prevents accepting partial URLs like "https://"
+            if absolute_url.scheme() == "http" || absolute_url.scheme() == "https" {
+                if absolute_url.host().is_none() {
+                    return Err(());
+                }
+            }
+            return Ok(absolute_url);
+        }
+        
+        // If that fails, try to resolve relative to the base URL
+        self.url.resolve_relative(raw).ok_or(())
     }
 
     pub fn print_tree(&self) {

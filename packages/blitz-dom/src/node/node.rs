@@ -4,12 +4,14 @@ use blitz_traits::events::{BlitzMouseButtonEvent, DomEventData, HitResult};
 use blitz_traits::shell::ShellProvider;
 use html_escape::encode_quoted_attribute_to_string;
 use keyboard_types::Modifiers;
+use kurbo::{BezPath, Point as KurboPoint, Shape};
 use markup5ever::{LocalName, local_name};
 use parley::Cluster;
 use selectors::matching::ElementSelectorFlags;
 use slab::Slab;
 use std::cell::{Cell, RefCell};
 use std::fmt::Write;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use style::Atom;
@@ -118,6 +120,13 @@ pub struct Node {
     pub unrounded_layout: Layout,
     pub final_layout: Layout,
     pub scroll_offset: crate::Point<f64>,
+    /// Cached clip-path BezPath for this node.
+    ///
+    /// This is populated during painting and used for hit-testing. The path is computed
+    /// from the CSS `clip-path` property and cached here to avoid recomputation. It's
+    /// updated each frame during painting (via `set_cached_clip_path`), so it reflects
+    /// the current styles and layout.
+    pub clip_path: RefCell<Option<Rc<BezPath>>>,
 }
 
 unsafe impl Send for Node {}
@@ -160,7 +169,16 @@ impl Node {
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             scroll_offset: crate::Point::ZERO,
+            clip_path: RefCell::new(None),
         }
+    }
+
+    pub fn cached_clip_path(&self) -> Option<Rc<BezPath>> {
+        self.clip_path.borrow().clone()
+    }
+
+    pub fn set_cached_clip_path(&self, path: Option<Rc<BezPath>>) {
+        *self.clip_path.borrow_mut() = path;
     }
 
     pub fn pe_by_index(&self, index: usize) -> Option<usize> {
@@ -833,6 +851,13 @@ impl Node {
             };
             x -= content_box_offset.x;
             y -= content_box_offset.y;
+        }
+
+        if let Some(path) = self.cached_clip_path() {
+            let point = KurboPoint::new(x as f64, y as f64);
+            if !path.contains(point) {
+                return None;
+            }
         }
 
         // Positive z_index hoisted children

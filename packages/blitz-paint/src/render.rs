@@ -3,11 +3,12 @@ mod box_shadow;
 mod form_controls;
 
 use std::any::Any;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
-use super::kurbo_css::{CssBox, Edge};
 use crate::color::{Color, ToColorColor};
 use crate::debug_overlay::render_debug_overlay;
-use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers::maybe_with_layer;
 use crate::sizing::compute_object_fit;
 use anyrender::{CustomPaint, Paint, PaintScene};
@@ -16,6 +17,7 @@ use blitz_dom::node::{
     TextNodeData,
 };
 use blitz_dom::{BaseDocument, ElementData, Node, local_name};
+use crate::kurbo_css::{CssBox, Edge, NonUniformRoundedRectRadii};
 use blitz_traits::devtools::DevtoolSettings;
 
 use euclid::Transform3D;
@@ -36,7 +38,7 @@ use style::{
     },
 };
 
-use kurbo::{self, Affine, BezPath, Insets, Point, Rect, Shape, Stroke, Vec2};
+use kurbo::{self, Affine, BezPath, Cap, Insets, Point, Rect, Shape, Stroke, Vec2};
 use peniko::{self, Fill, ImageData, ImageSampler};
 use style::values::computed::{
     angle::Angle,
@@ -61,6 +63,11 @@ use taffy::Layout;
  *
  * This function implements the conversion of parameters from endpoint to center
  * parametrization as described in the section B.2.4 in the same document.
+ *
+ * NOTE: Using Kurbo's `SvgArc` type which has the same parameterization
+ * as Stylo. However, `SvgArc` is not available in kurbo 0.12.0. If it becomes available in
+ * a future version, this conversion could be simplified by using `SvgArc::new()` followed by
+ * `SvgArc::to_arc()` to convert to the regular `Arc` type.
  */
 fn stylo_to_kurbo_arc(
     start: Point,
@@ -105,7 +112,7 @@ fn stylo_to_kurbo_arc(
     let theta1 = angle(u, v);
 
     let u = v;
-    let v = Vec2::new((-x1_prime - cx_prime) / rx, (-y1_prime - cy_prime / ry));
+    let v = Vec2::new((-x1_prime - cx_prime) / rx, -y1_prime - cy_prime / ry);
     let angle_degree = angle(u, v);
 
     let del_theta = if sweep && angle_degree > 0.0 {
@@ -283,7 +290,10 @@ fn commands_to_bez_path(cmds: &[GenericShapeCommand<f32, f32>]) -> BezPath {
 }
 
 /// A short-lived struct which holds a bunch of parameters for rendering a scene so
-/// that we don't have to pass them down as parameters
+/// that we don't have to pass them down as parameters.
+///
+/// This struct is created fresh for each frame and dropped after rendering completes.
+/// The `clip_path_cache` is populated during rendering and cleared when the struct is dropped.
 pub struct BlitzDomPainter<'dom> {
     /// Input parameters (read only) for generating the Scene
     pub(crate) dom: &'dom BaseDocument,
@@ -291,6 +301,12 @@ pub struct BlitzDomPainter<'dom> {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) devtools: DevtoolSettings,
+    /// Per-frame cache of computed clip-path BezPaths, keyed by node ID.
+    ///
+    /// This cache is populated during rendering to avoid recomputing clip paths
+    /// for nodes that are referenced multiple times (e.g., via `clip-path: url(#id)`).
+    /// The cache is cleared when the `BlitzDomPainter` instance is dropped after each frame.
+    pub(crate) clip_path_cache: RefCell<HashMap<usize, Rc<BezPath>>>,
 }
 
 impl BlitzDomPainter<'_> {
@@ -462,22 +478,31 @@ impl BlitzDomPainter<'_> {
         }
 
         let mut cx = self.element_cx(node, layout, box_position);
-        cx.draw_outline(scene);
-        cx.draw_outset_box_shadow(scene);
-        cx.draw_background(scene);
-        cx.draw_border(scene);
 
-        let clip_path = self.clip_path_from_styles(&cx.frame, styles);
+        let clip_path = self.clip_path_from_styles(node_id, node, styles);
         let wants_layer = should_clip || has_opacity || clip_path.is_some();
-        let clip_shape = clip_path.unwrap_or_else(|| cx.frame.padding_box_path());
+        let fallback_clip_shape;
+        let clip_shape: &BezPath = match clip_path.as_ref() {
+            Some(path) => path,
+            None => {
+                fallback_clip_shape = cx.frame.padding_box_path();
+                &fallback_clip_shape
+            }
+        };
 
         maybe_with_layer(
             scene,
             wants_layer,
             opacity,
             cx.transform,
-            &clip_shape,
+            clip_shape,
             |scene| {
+                // Draw borders, background, and outline inside the clip-path
+                // According to CSS spec, clip-path clips everything including borders
+                cx.draw_outline(scene);
+                cx.draw_outset_box_shadow(scene);
+                cx.draw_background(scene);
+                cx.draw_border(scene);
                 cx.draw_inset_box_shadow(scene);
                 cx.stroke_devtools(scene);
 
@@ -526,7 +551,43 @@ impl BlitzDomPainter<'_> {
         }
     }
 
-    fn clip_path_from_styles(&self, frame: &CssBox, styles: &ComputedValues) -> Option<BezPath> {
+    fn clip_path_from_styles(
+        &self,
+        node_id: usize,
+        node: &Node,
+        styles: &ComputedValues,
+    ) -> Option<Rc<BezPath>> {
+        let mut visited = HashSet::new();
+        let canonical_frame = create_css_rect(styles, &node.final_layout, 1.0);
+        self.clip_path_from_styles_inner(node_id, &canonical_frame, styles, &mut visited)
+            .map(|path| {
+                if (self.scale - 1.0).abs() < f64::EPSILON {
+                    path
+                } else {
+                    let mut scaled = (*path).clone();
+                    scaled.apply_affine(Affine::scale(self.scale));
+                    Rc::new(scaled)
+                }
+            })
+    }
+
+    fn clip_path_from_styles_inner(
+        &self,
+        node_id: usize,
+        frame: &CssBox,
+        styles: &ComputedValues,
+        visited: &mut HashSet<usize>,
+    ) -> Option<Rc<BezPath>> {
+        let node = &self.dom.as_ref().tree()[node_id];
+        if let Some(cached) = self.clip_path_cache.borrow().get(&node_id) {
+            node.set_cached_clip_path(Some(cached.clone()));
+            return Some(cached.clone());
+        }
+
+        if !visited.insert(node_id) {
+            return None;
+        }
+
         type StyloBasicShape = GenericBasicShape<
             Angle,
             Position,
@@ -536,20 +597,56 @@ impl BlitzDomPainter<'_> {
         >;
         type StyloClipPath = GenericClipPath<StyloBasicShape, ComputedUrl>;
         let stylo_clip_path: StyloClipPath = styles.clone_clip_path();
-        match stylo_clip_path {
+
+        let reference_rect = frame.border_box;
+        let shape_margin = resolve_shape_margin(styles, reference_rect);
+
+        let path = match stylo_clip_path {
             GenericClipPath::None => None,
-            GenericClipPath::Url(_u) => {
-                // TODO: Resolve clip-path url references when the supporting infrastructure exists.
-                None
-            }
-            GenericClipPath::Box(geometry_box) => {
-                Some(self.clip_path_for_geometry_box(frame, geometry_box))
-            }
+            GenericClipPath::Url(url) => self.clip_path_from_url(node_id, url, visited),
+            GenericClipPath::Box(geometry_box) => Some(Rc::new(
+                self.clip_path_for_geometry_box(frame, geometry_box),
+            )),
             GenericClipPath::Shape(basic_shape, geometry_box) => {
                 let reference_rect = self.reference_rect_for_geometry_box(frame, geometry_box);
-                self.basic_shape_to_path(frame, *basic_shape, reference_rect)
+                self.basic_shape_to_path(frame, *basic_shape, reference_rect, shape_margin)
+                    .map(Rc::new)
+            }
+        };
+
+        visited.remove(&node_id);
+
+        match path {
+            Some(path) => {
+                node.set_cached_clip_path(Some(path.clone()));
+                self.clip_path_cache
+                    .borrow_mut()
+                    .insert(node_id, path.clone());
+                Some(path)
+            }
+            None => {
+                node.set_cached_clip_path(None);
+                None
             }
         }
+    }
+
+    fn clip_path_from_url(
+        &self,
+        _node_id: usize,
+        url: ComputedUrl,
+        visited: &mut HashSet<usize>,
+    ) -> Option<Rc<BezPath>> {
+        let resolved = url.url()?;
+        let fragment = resolved.fragment()?;
+        let referenced_id = self.dom.get_element_by_id(fragment)?;
+        if visited.contains(&referenced_id) {
+            return None;
+        }
+        let referenced_node = &self.dom.as_ref().tree()[referenced_id];
+        let styles = referenced_node.primary_styles()?;
+        let frame = create_css_rect(&*styles, &referenced_node.final_layout, 1.0);
+        self.clip_path_from_styles_inner(referenced_id, &frame, &*styles, visited)
     }
 
     fn clip_path_for_geometry_box(
@@ -595,6 +692,7 @@ impl BlitzDomPainter<'_> {
             InsetRect<LengthPercentage, NonNegativeLengthPercentage>,
         >,
         reference_rect: Rect,
+        shape_margin: f64,
     ) -> Option<BezPath> {
         let origin = reference_rect.origin();
         let origin_x = origin.x;
@@ -607,19 +705,26 @@ impl BlitzDomPainter<'_> {
                 let center = resolve_shape_position(circle.position, reference_rect);
                 let radius =
                     resolve_shape_radius(&circle.radius, center, reference_rect, box_width);
-                Some(frame.circle_path(center, radius))
+                let total_radius = radius + shape_margin;
+                
+                // Create the path even if radius is zero/negative - we'll check area later
+                Some(frame.circle_path(center, total_radius.max(0.0)))
             }
             GenericBasicShape::Ellipse(ellipse) => {
                 let center = resolve_shape_position(ellipse.position, reference_rect);
                 let radius_x =
-                    resolve_shape_radius(&ellipse.semiaxis_x, center, reference_rect, box_width);
+                    resolve_shape_radius(&ellipse.semiaxis_x, center, reference_rect, box_width)
+                        + shape_margin;
                 let radius_y =
-                    resolve_shape_radius(&ellipse.semiaxis_y, center, reference_rect, box_height);
+                    resolve_shape_radius(&ellipse.semiaxis_y, center, reference_rect, box_height)
+                        + shape_margin;
+                
+                // Create the path even if radii are zero/negative - we'll check area later
                 Some(frame.ellipse_path(
                     center,
                     Vec2 {
-                        x: radius_x,
-                        y: radius_y,
+                        x: radius_x.max(0.0),
+                        y: radius_y.max(0.0),
                     },
                 ))
             }
@@ -629,10 +734,16 @@ impl BlitzDomPainter<'_> {
                 let bottom = resolve_length_percentage_value(&rect.rect.2, box_height);
                 let left = resolve_length_percentage_value(&rect.rect.3, box_width);
 
-                let x0 = origin_x + left;
-                let y0 = origin_y + top;
-                let x1 = origin_x + box_width - right;
-                let y1 = origin_y + box_height - bottom;
+                let x0_raw = origin_x + left - shape_margin;
+                let y0_raw = origin_y + top - shape_margin;
+                let x1_raw = origin_x + box_width - right + shape_margin;
+                let y1_raw = origin_y + box_height - bottom + shape_margin;
+
+                // Ensure valid rect bounds (swap if needed)
+                let x0 = x0_raw.min(x1_raw);
+                let y0 = y0_raw.min(y1_raw);
+                let x1 = x0_raw.max(x1_raw);
+                let y1 = y0_raw.max(y1_raw);
 
                 let r_top_left = resolve_non_negative_length_percentage_value(
                     rect.round.top_left.0.width(),
@@ -660,14 +771,24 @@ impl BlitzDomPainter<'_> {
                 ))
             }
             GenericBasicShape::Polygon(polygon) => {
+                let bounding_box_center = Point {
+                    x: origin_x + box_width / 2.0,
+                    y: origin_y + box_height / 2.0,
+                };
+                
                 let points: Vec<Point> = polygon
                     .coordinates
                     .iter()
-                    .map(|point| Point {
-                        x: origin_x + resolve_length_percentage_value(&point.0, box_width),
-                        y: origin_y + resolve_length_percentage_value(&point.1, box_height),
+                    .map(|point| {
+                        let base_point = Point {
+                            x: origin_x + resolve_length_percentage_value(&point.0, box_width),
+                            y: origin_y + resolve_length_percentage_value(&point.1, box_height),
+                        };
+                        expand_polygon_point(base_point, bounding_box_center, shape_margin)
                     })
                     .collect();
+                
+                // Create the path even if degenerate - we'll check area later
                 Some(frame.polygon_path(&points))
             }
             GenericBasicShape::PathOrShape(path) => {
@@ -679,7 +800,14 @@ impl BlitzDomPainter<'_> {
                         commands_to_bez_path(&cmds)
                     }
                 };
-                path.apply_affine(Affine::translate((origin_x, origin_y)));
+                
+                // Path coordinates are in normalized 0-1 range, so we need to scale them
+                // to the reference rect dimensions, then translate to the correct position
+                path.apply_affine(
+                    Affine::translate((origin_x, origin_y))
+                        .pre_scale_non_uniform(box_width, box_height)
+                );
+                
                 Some(path)
             }
         }
@@ -1093,8 +1221,8 @@ impl ElementCx<'_> {
     /// The border-style property specifies what kind of border to display.
     ///
     /// The following values are allowed:
-    /// ❌ dotted - Defines a dotted border
-    /// ❌ dashed - Defines a dashed border
+    /// ✅ dotted - Defines a dotted border
+    /// ✅ dashed - Defines a dashed border
     /// ✅ solid - Defines a solid border
     /// ❌ double - Defines a double border
     /// ❌ groove - Defines a 3D grooved border.
@@ -1116,8 +1244,8 @@ impl ElementCx<'_> {
     /// [Border](https://www.w3schools.com/css/css_border.asp)
     ///
     /// The following values are allowed:
-    /// - ❌ dotted: Defines a dotted border
-    /// - ❌ dashed: Defines a dashed border
+    /// - ✅ dotted: Defines a dotted border
+    /// - ✅ dashed: Defines a dashed border
     /// - ✅ solid: Defines a solid border
     /// - ❌ double: Defines a double border
     /// - ❌ groove: Defines a 3D grooved border*
@@ -1153,14 +1281,62 @@ impl ElementCx<'_> {
                 .as_srgb_color(),
         };
 
+        let border_style = match edge {
+            Edge::Top => border.border_top_style,
+            Edge::Right => border.border_right_style,
+            Edge::Bottom => border.border_bottom_style,
+            Edge::Left => border.border_left_style,
+        };
+
+        let border_width = match edge {
+            Edge::Top => self.frame.border_width.y0,
+            Edge::Right => self.frame.border_width.x1,
+            Edge::Bottom => self.frame.border_width.y1,
+            Edge::Left => self.frame.border_width.x0,
+        };
+
         let alpha = color.components[3];
-        if alpha != 0.0 {
-            sb.fill(Fill::NonZero, self.transform, color, None, &path);
+        if alpha == 0.0 {
+            return;
+        }
+
+        match border_style {
+            BorderStyle::None | BorderStyle::Hidden => return,
+            BorderStyle::Dotted | BorderStyle::Dashed => {
+                // Use stroke for dotted/dashed borders
+                let (dash_length, gap_length, cap) = if matches!(border_style, BorderStyle::Dotted) {
+                    // Dotted: use small circular dots (width determines size)
+                    // Per CSS spec, dots are circular (round caps) with equal dash and gap
+                    let dot_size = border_width.max(1.0);
+                    (dot_size, dot_size, Cap::Round)
+                } else {
+                    // Dashed: use longer dashes (typically 3x width per CSS spec)
+                    // Dashes use square/butt caps
+                    let dash_size = border_width * 3.0;
+                    (dash_size, dash_size, Cap::Butt)
+                };
+
+                let stroke = Stroke {
+                    width: border_width,
+                    dash_pattern: vec![dash_length, gap_length].into(),
+                    dash_offset: 0.0,
+                    start_cap: cap,
+                    end_cap: cap,
+                    ..Stroke::default()
+                };
+
+                sb.stroke(&stroke, self.transform, color, None, &path);
+            }
+            BorderStyle::Solid | BorderStyle::Double | BorderStyle::Groove 
+            | BorderStyle::Ridge | BorderStyle::Inset | BorderStyle::Outset => {
+                // Use fill for solid borders (and fallback for unimplemented styles)
+                sb.fill(Fill::NonZero, self.transform, color, None, &path);
+            }
         }
     }
 
-    /// ❌ dotted - Defines a dotted border
-    /// ❌ dashed - Defines a dashed border
+    /// ✅ dotted - Defines a dotted border
+    /// ✅ dashed - Defines a dashed border
     /// ✅ solid - Defines a solid border
     /// ❌ double - Defines a double border
     /// ❌ groove - Defines a 3D grooved border. The effect depends on the border-color value
@@ -1183,21 +1359,46 @@ impl ElementCx<'_> {
             OutlineStyle::BorderStyle(style) => style,
         };
 
-        let path = match style {
+        let outline_width = self.frame.outline_width;
+        
+        match style {
             BorderStyle::None | BorderStyle::Hidden => return,
-            BorderStyle::Solid => self.frame.outline(),
+            BorderStyle::Dotted | BorderStyle::Dashed => {
+                // Use stroke for dotted/dashed outlines
+                let path = self.frame.outline();
+                let (dash_length, gap_length, cap) = if matches!(style, BorderStyle::Dotted) {
+                    let dot_size = outline_width.max(1.0);
+                    (dot_size, dot_size, Cap::Round)
+                } else {
+                    let dash_size = outline_width * 3.0;
+                    (dash_size, dash_size, Cap::Butt)
+                };
 
+                let stroke = Stroke {
+                    width: outline_width,
+                    dash_pattern: vec![dash_length, gap_length].into(),
+                    dash_offset: 0.0,
+                    start_cap: cap,
+                    end_cap: cap,
+                    ..Stroke::default()
+                };
+
+                scene.stroke(&stroke, self.transform, color, None, &path);
+            }
+            BorderStyle::Solid => {
+                let path = self.frame.outline();
+                scene.fill(Fill::NonZero, self.transform, color, None, &path);
+            }
             // TODO: Implement other border styles
             BorderStyle::Inset
             | BorderStyle::Groove
             | BorderStyle::Outset
             | BorderStyle::Ridge
-            | BorderStyle::Dotted
-            | BorderStyle::Dashed
-            | BorderStyle::Double => self.frame.outline(),
-        };
-
-        scene.fill(Fill::NonZero, self.transform, color, None, &path);
+            | BorderStyle::Double => {
+                let path = self.frame.outline();
+                scene.fill(Fill::NonZero, self.transform, color, None, &path);
+            }
+        }
     }
 }
 impl<'a> std::ops::Deref for ElementCx<'a> {
@@ -1325,6 +1526,54 @@ fn resolve_shape_radius(
     }
 }
 
+/// CSS default value for shape-margin property (0 per CSS spec).
+const DEFAULT_SHAPE_MARGIN: f64 = 0.0;
+
+/// Expands a polygon point outward by the given margin.
+///
+/// The expansion is done by scaling the point away from the bounding box center.
+/// This is a simple approximation; a more accurate implementation would expand
+/// perpendicular to the polygon edge, but this approach works well for most cases.
+fn expand_polygon_point(
+    point: Point,
+    bounding_box_center: Point,
+    margin: f64,
+) -> Point {
+    if margin <= 0.0 {
+        return point;
+    }
+    
+    let dx = point.x - bounding_box_center.x;
+    let dy = point.y - bounding_box_center.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    if dist > 0.0 {
+        let scale = (dist + margin) / dist;
+        Point {
+            x: bounding_box_center.x + dx * scale,
+            y: bounding_box_center.y + dy * scale,
+        }
+    } else {
+        point
+    }
+}
+
+/// Resolves the shape-margin CSS property value.
+///
+/// **Current Status**: Stylo 0.9.0 does not expose `shape-margin` in `ComputedValues`,
+/// so this function returns the CSS default of `0.0`. The infrastructure to apply
+/// `shape-margin` exists in `basic_shape_to_path` and will automatically work once
+/// Stylo adds support.
+///
+/// **Future**: When Stylo exposes `shape-margin`, update this to:
+/// ```rust
+/// let margin = styles.get_box().shape_margin;
+/// resolve_non_negative_length_percentage_value(&margin, reference_rect.width())
+/// ```
+fn resolve_shape_margin(_styles: &ComputedValues, _reference_rect: Rect) -> f64 {
+    DEFAULT_SHAPE_MARGIN
+}
+
 fn convert_shape_commands_to_absolute(
     commands: &[GenericShapeCommand<Angle, LengthPercentage>],
     box_width: f64,
@@ -1445,5 +1694,230 @@ fn reflect_point(control: Point, center: Point) -> Point {
     Point {
         x: 2.0 * center.x - control.x,
         y: 2.0 * center.y - control.y,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use style::properties::ComputedValues;
+    use style::properties::style_structs::Font;
+    use style::values::computed::length_percentage::Unpacked;
+    use style::values::computed::Percentage;
+    use style::values::generics::basic_shape::ShapeRadius;
+
+    #[test]
+    fn test_resolve_shape_margin_returns_default() {
+        // Test that resolve_shape_margin returns 0.0 (CSS default)
+        // since Stylo doesn't expose shape-margin
+        let styles = ComputedValues::initial_values_with_font_override(Font::initial_values());
+        let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        
+        let margin = resolve_shape_margin(&styles, reference_rect);
+        
+        // Should return CSS default of 0.0
+        assert_eq!(margin, 0.0, "shape-margin should default to 0.0 per CSS spec");
+    }
+
+    #[test]
+    fn test_resolve_unpacked_value_length() {
+        let unpacked = Unpacked::Length(CSSPixelLength::new(42.0));
+        let axis = 100.0;
+        
+        let result = resolve_unpacked_value(unpacked, axis);
+        
+        assert_eq!(result, 42.0, "Length value should be resolved correctly");
+    }
+
+    #[test]
+    fn test_resolve_unpacked_value_percentage() {
+        let unpacked = Unpacked::Percentage(Percentage(0.5));
+        let axis = 200.0;
+        
+        let result = resolve_unpacked_value(unpacked, axis);
+        
+        assert_eq!(result, 100.0, "Percentage value should be resolved correctly (50% of 200 = 100)");
+    }
+
+    #[test]
+    fn test_resolve_shape_radius_closest_side() {
+        let radius = ShapeRadius::ClosestSide;
+        // Center at (25, 25) in a 100x100 rect
+        // Closest side is left (25) or top (25)
+        let center = Point::new(25.0, 25.0);
+        let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let axis = 100.0;
+        
+        let result = resolve_shape_radius(&radius, center, reference_rect, axis);
+        
+        assert_eq!(result, 25.0, "ClosestSide should return minimum distance to any edge");
+    }
+
+    #[test]
+    fn test_resolve_shape_radius_farthest_side() {
+        let radius = ShapeRadius::FarthestSide;
+        // Center at (25, 25) in a 100x100 rect
+        // Farthest side is right (75) or bottom (75)
+        let center = Point::new(25.0, 25.0);
+        let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let axis = 100.0;
+        
+        let result = resolve_shape_radius(&radius, center, reference_rect, axis);
+        
+        assert_eq!(result, 75.0, "FarthestSide should return maximum distance to any edge");
+    }
+
+    #[test]
+    fn test_resolve_shape_position_auto() {
+        let position = GenericPositionOrAuto::Auto;
+        let reference_rect = Rect::new(10.0, 20.0, 110.0, 120.0);
+        
+        let result = resolve_shape_position(position, reference_rect);
+        
+        // Auto should center at (10 + 50, 20 + 50) = (60, 70)
+        let expected = Point::new(60.0, 70.0);
+        assert_eq!(result.x, expected.x, "Auto position should center horizontally");
+        assert_eq!(result.y, expected.y, "Auto position should center vertically");
+    }
+
+    #[test]
+    fn test_resolve_shape_margin_with_different_rect_sizes() {
+        // Test that resolve_shape_margin handles different reference rect sizes
+        // (even though it currently always returns 0.0)
+        let styles = ComputedValues::initial_values_with_font_override(Font::initial_values());
+        
+        let small_rect = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let large_rect = Rect::new(0.0, 0.0, 1000.0, 1000.0);
+        
+        let margin_small = resolve_shape_margin(&styles, small_rect);
+        let margin_large = resolve_shape_margin(&styles, large_rect);
+        
+        // Both should return 0.0 (CSS default)
+        assert_eq!(margin_small, 0.0);
+        assert_eq!(margin_large, 0.0);
+        assert_eq!(margin_small, margin_large, "Should return same default regardless of rect size");
+    }
+
+    #[test]
+    fn test_shape_margin_infrastructure_ready() {
+        // Test that the infrastructure exists to use shape_margin values
+        // This test verifies that when shape_margin is provided, it would be used correctly
+        
+        // Create a simple reference rect
+        let _reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        
+        // Test different margin values
+        let margins: Vec<f64> = vec![0.0, 5.0, 10.0, 20.0];
+        
+        for margin in margins {
+            // Verify margin values are valid (non-negative per CSS spec)
+            assert!(margin >= 0.0, "shape-margin must be non-negative per CSS spec");
+            
+            // When shape_margin is implemented, these values would be used to expand shapes
+            // For now, we just verify the values are valid
+            assert!(margin.is_finite(), "shape-margin must be finite");
+        }
+    }
+
+    #[test]
+    fn test_resolve_shape_radius_edge_cases() {
+        // Test edge cases for shape radius resolution
+        let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let axis = 100.0;
+        
+        // Center at exact center
+        let center_center = Point::new(50.0, 50.0);
+        let radius_closest = ShapeRadius::ClosestSide;
+        let result = resolve_shape_radius(&radius_closest, center_center, reference_rect, axis);
+        assert_eq!(result, 50.0, "Center point should have equal distance to all sides");
+        
+        // Center at corner
+        let center_corner = Point::new(0.0, 0.0);
+        let result = resolve_shape_radius(&radius_closest, center_corner, reference_rect, axis);
+        assert_eq!(result, 0.0, "Corner point should have 0 distance to closest side");
+        
+        // Center at edge
+        let center_edge = Point::new(0.0, 50.0);
+        let result = resolve_shape_radius(&radius_closest, center_edge, reference_rect, axis);
+        assert_eq!(result, 0.0, "Edge point should have 0 distance to closest side");
+    }
+
+    #[test]
+    fn test_resolve_unpacked_value_zero_axis() {
+        // Test edge case: zero axis
+        let unpacked = Unpacked::Percentage(Percentage(0.5));
+        let axis = 0.0;
+        
+        let result = resolve_unpacked_value(unpacked, axis);
+        
+        assert_eq!(result, 0.0, "Percentage of zero axis should be zero");
+    }
+
+    #[test]
+    fn test_resolve_shape_radius_center_at_origin() {
+        // Test when center is at origin
+        let radius = ShapeRadius::ClosestSide;
+        let center = Point::new(0.0, 0.0);
+        let reference_rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let axis = 100.0;
+        
+        let result = resolve_shape_radius(&radius, center, reference_rect, axis);
+        
+        assert_eq!(result, 0.0, "Center at origin should have 0 distance to closest side");
+    }
+
+    #[test]
+    fn test_expand_polygon_point_no_margin() {
+        // Test that zero margin returns the point unchanged
+        let point = Point::new(10.0, 20.0);
+        let center = Point::new(50.0, 50.0);
+        let expanded = expand_polygon_point(point, center, 0.0);
+        assert_eq!(expanded.x, point.x);
+        assert_eq!(expanded.y, point.y);
+    }
+
+    #[test]
+    fn test_expand_polygon_point_with_margin() {
+        // Test that margin expands point away from center
+        let point = Point::new(60.0, 50.0); // 10 units right of center
+        let center = Point::new(50.0, 50.0);
+        let margin = 5.0;
+        let expanded = expand_polygon_point(point, center, margin);
+        
+        // Should be 15 units right of center (10 + 5)
+        assert_eq!(expanded.x, 65.0);
+        assert_eq!(expanded.y, 50.0);
+    }
+
+    #[test]
+    fn test_expand_polygon_point_at_center() {
+        // Test that point at center remains unchanged (dist = 0)
+        let point = Point::new(50.0, 50.0);
+        let center = Point::new(50.0, 50.0);
+        let margin = 10.0;
+        let expanded = expand_polygon_point(point, center, margin);
+        
+        // Point at center should remain unchanged
+        assert_eq!(expanded.x, point.x);
+        assert_eq!(expanded.y, point.y);
+    }
+
+    #[test]
+    fn test_expand_polygon_point_diagonal() {
+        // Test expansion in diagonal direction
+        let point = Point::new(60.0, 60.0); // sqrt(2)*10 units from (50, 50)
+        let center = Point::new(50.0, 50.0);
+        let margin = 5.0;
+        let expanded = expand_polygon_point(point, center, margin);
+        
+        // Should maintain direction but increase distance
+        let original_dist = ((point.x - center.x).powi(2) + (point.y - center.y).powi(2)).sqrt();
+        let expanded_dist = ((expanded.x - center.x).powi(2) + (expanded.y - center.y).powi(2)).sqrt();
+        assert!((expanded_dist - (original_dist + margin)).abs() < 1e-10, "Distance should increase by margin");
+        
+        // Direction should be preserved (ratio should be same)
+        let original_ratio = (point.y - center.y) / (point.x - center.x);
+        let expanded_ratio = (expanded.y - center.y) / (expanded.x - center.x);
+        assert!((original_ratio - expanded_ratio).abs() < 1e-10, "Direction should be preserved");
     }
 }

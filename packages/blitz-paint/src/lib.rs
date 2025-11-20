@@ -40,6 +40,7 @@ pub fn paint_scene(
         width,
         height,
         devtools,
+        clip_path_cache: Default::default(),
     };
     generator.paint_scene(scene);
 
